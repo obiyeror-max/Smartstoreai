@@ -1,0 +1,6 @@
+{
+  "name": "SmartStore AI",
+  "description": "WhatsApp-based inventory, pricing assistant, and multi-tenant owner dashboard for retail supermarkets and provision stores.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
