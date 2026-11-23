@@ -69,7 +69,7 @@ export function WhatsAppSimulator({
         id: `welcome_${shop.id}`,
         sender: 'assistant',
         timestamp: new Date().toISOString(),
-        text: `Good afternoon. You are chatting with ${shop.name}'s SmartStore AI assistant.\nAsk naturally for any price or stock level—no special commands needed.`,
+        text: `Good afternoon. You are chatting with ${shop.name}'s Sabi AI assistant.\nAsk naturally for any price or stock level—no special commands needed.`,
       },
     ];
   }, [messagesByShop, shop.id, shop.name]);
@@ -97,7 +97,7 @@ export function WhatsAppSimulator({
           id: `welcome_${shopId}`,
           sender: 'assistant',
           timestamp: new Date().toISOString(),
-          text: `Good afternoon. You are chatting with ${shop.name}'s SmartStore AI assistant.\nAsk naturally for any price or stock level—no special commands needed.`,
+          text: `Good afternoon. You are chatting with ${shop.name}'s Sabi AI assistant.\nAsk naturally for any price or stock level—no special commands needed.`,
         },
       ];
       return { ...prev, [shopId]: [...current, msg] };
@@ -161,7 +161,7 @@ export function WhatsAppSimulator({
 
       await onDatabaseUpdated();
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : 'Unable to reach SmartStore backend.';
+      const errMsg = err instanceof Error ? err.message : 'Unable to reach Sabi AI backend.';
       appendMessage(shop.id, {
         id: `err_${messageId}`,
         sender: 'assistant',

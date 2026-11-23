@@ -72,7 +72,7 @@ export async function processIncomingWhatsAppEvent(
   if (!shop) {
     return {
       status: 'error',
-      replyText: 'No connected SmartStore shop found for this WhatsApp number.',
+      replyText: 'No connected Sabi AI shop found for this WhatsApp number.',
       senderRole: 'external',
       accessDenied: true,
     };

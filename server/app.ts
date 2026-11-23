@@ -11,7 +11,7 @@ export function createApiApp() {
   // Health & active AI engine info endpoint
   app.get('/api/health', async (_req, res) => {
     const ai = await getActiveAiInfo();
-    res.json({ ok: true, service: 'SmartStore AI', ai });
+    res.json({ ok: true, service: 'Sabi AI', ai });
   });
 
   // List all shops (for tenant switcher)

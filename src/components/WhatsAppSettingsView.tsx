@@ -194,7 +194,7 @@ export function WhatsAppSettingsView({ shop, onRefresh }: WhatsAppSettingsViewPr
         <div>
           <h2 className="text-base font-semibold text-slate-900">SaaS subscription plan</h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Switch plans to test SmartStore AI&apos;s multi-tier retail pricing structure.
+            Switch plans to test Sabi AI&apos;s multi-tier retail pricing structure.
           </p>
         </div>
 

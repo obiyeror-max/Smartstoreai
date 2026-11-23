@@ -575,7 +575,7 @@ function createSeedState(): DatabaseState {
       type: 'price_review',
       title: 'Price review recommended (2 items)',
       message: 'Milo 900 g refill and Peak Milk Powder 400 g had supplier cost increases.',
-      actorName: 'SmartStore Price Assistant',
+      actorName: 'Sabi AI Price Assistant',
       read: false,
       createdAt: hoursAgo(4),
     },

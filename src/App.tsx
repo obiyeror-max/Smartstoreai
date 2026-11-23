@@ -104,7 +104,7 @@ export default function App() {
       <aside className="hidden lg:flex lg:w-60 lg:flex-col lg:fixed lg:inset-y-0 bg-white border-r border-slate-200 z-30">
         <div className="px-5 py-4 border-b border-slate-200">
           <span className="text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap">
-            SmartStore AI
+            Sabi AI
           </span>
         </div>
 
@@ -190,7 +190,7 @@ export default function App() {
             <Menu className="w-5 h-5" />
           </button>
           <span className="text-base font-bold tracking-tight text-slate-900 whitespace-nowrap">
-            SmartStore AI
+            Sabi AI
           </span>
         </div>
 
@@ -225,7 +225,7 @@ export default function App() {
           />
           <div className="relative w-72 max-w-[85vw] bg-white h-full flex flex-col z-10 border-r border-slate-200">
             <div className="px-4 py-3.5 border-b border-slate-200 flex items-center justify-between">
-              <span className="text-base font-bold text-slate-900">SmartStore AI</span>
+              <span className="text-base font-bold text-slate-900">Sabi AI</span>
               <button
                 type="button"
                 onClick={() => setMobileMenuOpen(false)}

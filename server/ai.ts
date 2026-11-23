@@ -71,7 +71,7 @@ function buildGroundedSystemPrompt(
     return `- ID:${p.id} | ${p.name} (${p.packSize}) | SKU:${p.sku} | Cat:${p.category} | Price:₦${p.sellingPrice.toLocaleString('en-NG')} | Stock:${p.stockQuantity} ${p.unit} (${stockStatus}, reorder≤${p.reorderLevel})${expiryInfo}${costInfo}`;
   });
 
-  return `You are SmartStore AI, a sharp, helpful, conversational WhatsApp shop assistant for "${shop.name}" (${shop.location}).
+  return `You are Sabi AI, a sharp, helpful, conversational WhatsApp shop assistant for "${shop.name}" (${shop.location}).
 Today's date: ${todayStr}.
 You are currently chatting with staff member: ${staffName} (Role: ${staffRole.toUpperCase()}).
 
