@@ -20,9 +20,24 @@ async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
-  const data = await res.json();
+  const text = await res.text();
+  let data: Record<string, unknown> | null = null;
+  if (text) {
+    try {
+      data = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      data = null;
+    }
+  }
   if (!res.ok) {
-    throw new Error(data.error || `Request failed (${res.status})`);
+    const serverMsg =
+      data && typeof data.error === 'string'
+        ? data.error
+        : `Request failed (${res.status})`;
+    throw new Error(serverMsg);
+  }
+  if (!data) {
+    throw new Error('Unexpected non-JSON response from server.');
   }
   return data as T;
 }
