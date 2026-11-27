@@ -10,17 +10,21 @@ import type {
 export interface IncomingWhatsAppWebhook {
   messageId: string;
   shopId?: string;
+  phoneNumberId?: string;
   toBusinessPhone?: string;
   fromPhone: string;
   messageText: string;
   history?: ChatHistoryTurn[];
   selectedProductId?: string;
+  interactiveReplyId?: string;
   confirmedAction?: PendingConfirmation;
 }
 
 export interface WhatsAppProcessorResult {
   status: 'ok' | 'duplicate' | 'error';
   replyText: string;
+  shopId?: string;
+  whatsappPhoneNumberId?: string | null;
   senderName?: string;
   senderRole?: 'owner' | 'manager' | 'attendant' | 'external';
   accessDenied?: boolean;
@@ -55,19 +59,19 @@ export async function processIncomingWhatsAppEvent(
   payload: IncomingWhatsAppWebhook
 ): Promise<WhatsAppProcessorResult> {
   // 1. Duplicate webhook idempotency check
-  if (payload.messageId && store.isMessageProcessed(payload.messageId)) {
+  if (payload.messageId && (await store.isMessageProcessed(payload.messageId))) {
     return {
       status: 'duplicate',
       replyText: 'Duplicate webhook event ignored safely.',
     };
   }
 
-  // 2. Resolve Shop boundary
-  const shop = payload.shopId
-    ? store.getShopById(payload.shopId)
-    : payload.toBusinessPhone
-    ? store.getShopByWhatsappNumber(payload.toBusinessPhone)
-    : undefined;
+  // 2. Resolve Shop boundary (shopId, Meta phoneNumberId, or business WhatsApp number)
+  const shop = await store.getShopByWhatsappIdentity({
+    shopId: payload.shopId,
+    phoneNumberId: payload.phoneNumberId,
+    toBusinessPhone: payload.toBusinessPhone,
+  });
 
   if (!shop) {
     return {
@@ -81,6 +85,8 @@ export async function processIncomingWhatsAppEvent(
   if (!shop.whatsappConnected) {
     return {
       status: 'error',
+      shopId: shop.id,
+      whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
       replyText: `${shop.name}'s WhatsApp assistant is currently paused by the owner.`,
       senderRole: 'external',
       accessDenied: true,
@@ -88,9 +94,9 @@ export async function processIncomingWhatsAppEvent(
   }
 
   // 3. Verify staff membership strictly inside THIS shop
-  const staffMember = store.findStaffByPhoneInShop(shop.id, payload.fromPhone);
+  const staffMember = await store.findStaffByPhoneInShop(shop.id, payload.fromPhone);
   if (!staffMember || !staffMember.active) {
-    store.logActivity({
+    await store.logActivity({
       shopId: shop.id,
       type: 'access_denied',
       actorName: payload.fromPhone,
@@ -101,10 +107,12 @@ export async function processIncomingWhatsAppEvent(
       channel: 'whatsapp',
     });
 
-    if (payload.messageId) store.markMessageProcessed(payload.messageId);
+    if (payload.messageId) await store.markMessageProcessed(payload.messageId);
 
     return {
       status: 'ok',
+      shopId: shop.id,
+      whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
       senderName: 'Unregistered Number',
       senderRole: 'external',
       accessDenied: true,
@@ -112,13 +120,56 @@ export async function processIncomingWhatsAppEvent(
     };
   }
 
-  if (payload.messageId) store.markMessageProcessed(payload.messageId);
+  if (payload.messageId) await store.markMessageProcessed(payload.messageId);
+
+  const thread = await store.getWhatsAppThread(shop.id, payload.fromPhone);
+  const interactiveId = payload.interactiveReplyId?.trim() || '';
+  const trimmedText = payload.messageText.trim();
+  const normalizedCmd = trimmedText.toLowerCase();
+
+  // Resolve interactive callbacks or text confirmations against stored pendingConfirmation
+  let resolvedConfirmedAction = payload.confirmedAction;
+  let resolvedSelectedProductId = payload.selectedProductId;
+
+  if (!resolvedConfirmedAction && thread.pendingConfirmation) {
+    if (
+      interactiveId === 'confirm:apply' ||
+      ['confirm', 'confirm update', 'yes', 'ok', 'proceed', 'approve'].includes(normalizedCmd)
+    ) {
+      resolvedConfirmedAction = thread.pendingConfirmation;
+    } else if (
+      interactiveId === 'cancel_action' ||
+      ['cancel', 'no', 'stop', 'abort'].includes(normalizedCmd)
+    ) {
+      const cancelReply = 'Update cancelled. No prices or stock quantities were changed.';
+      await store.saveWhatsAppThread(shop.id, payload.fromPhone, {
+        history: [
+          ...thread.history,
+          { role: 'user', text: trimmedText || 'Cancel' },
+          { role: 'assistant', text: cancelReply },
+        ],
+        pendingConfirmation: null,
+      });
+      return {
+        status: 'ok',
+        shopId: shop.id,
+        whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
+        senderName: staffMember.name,
+        senderRole: staffMember.role,
+        replyText: cancelReply,
+      };
+    }
+  }
+
+  if (!resolvedSelectedProductId && interactiveId.startsWith('pick:')) {
+    resolvedSelectedProductId = interactiveId.slice('pick:'.length);
+  }
 
   // 4. Handle explicit confirmation of a pending price/stock change
-  if (payload.confirmedAction) {
-    const action = payload.confirmedAction;
+  if (resolvedConfirmedAction) {
+    const action = resolvedConfirmedAction;
     if (staffMember.role === 'attendant') {
-      store.logActivity({
+      await store.logActivity({
         shopId: shop.id,
         type: 'access_denied',
         actorName: staffMember.name,
@@ -127,16 +178,23 @@ export async function processIncomingWhatsAppEvent(
         summary: `Denied ${action.actionType} permission for Attendant ${staffMember.name}`,
         channel: 'whatsapp',
       });
+      await store.saveWhatsAppThread(shop.id, payload.fromPhone, {
+        history: thread.history,
+        pendingConfirmation: null,
+      });
       return {
         status: 'ok',
+        shopId: shop.id,
+        whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
         senderName: staffMember.name,
         senderRole: staffMember.role,
         accessDenied: true,
-        replyText: `Permission denied. Attendants can look up prices and stock, but only a Manager or Owner can modify inventory or selling prices.`,
+        replyText:
+          'Permission denied. Attendants can look up prices and stock, but only a Manager or Owner can modify inventory or selling prices.',
       };
     }
 
-    const updated = store.updateProduct(shop.id, action.productId, {
+    const updated = await store.updateProduct(shop.id, action.productId, {
       sellingPrice: action.newPrice,
       stockQuantity: action.newStockQuantity,
       actorName: staffMember.name,
@@ -146,41 +204,62 @@ export async function processIncomingWhatsAppEvent(
     });
 
     if (!updated) {
+      await store.saveWhatsAppThread(shop.id, payload.fromPhone, {
+        history: thread.history,
+        pendingConfirmation: null,
+      });
       return {
         status: 'ok',
+        shopId: shop.id,
+        whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
         senderName: staffMember.name,
         senderRole: staffMember.role,
         replyText: 'Could not apply update because the product was no longer found.',
       };
     }
 
+    const replyText =
+      action.actionType === 'price_change'
+        ? `Confirmed & saved to ${shop.name}:\n${updated.name} (${updated.packSize})\nPrevious price: ${
+            updated.previousSellingPrice !== null ? formatNaira(updated.previousSellingPrice) : '—'
+          }\nNew selling price: ${formatNaira(updated.sellingPrice)}\nUpdated by ${staffMember.name} · Authorised staff notified & synced immediately.`
+        : `Confirmed & saved to ${shop.name} database:\n${updated.name} (${updated.packSize})\nSelling price: ${formatNaira(updated.sellingPrice)}\nRecorded stock: ${updated.stockQuantity} ${updated.unit}`;
+
+    await store.saveWhatsAppThread(shop.id, payload.fromPhone, {
+      history: [
+        ...thread.history,
+        { role: 'user', text: trimmedText || 'Confirm update' },
+        { role: 'assistant', text: replyText },
+      ],
+      pendingConfirmation: null,
+    });
+
     return {
       status: 'ok',
+      shopId: shop.id,
+      whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
       senderName: staffMember.name,
       senderRole: staffMember.role,
       mutatedDatabase: true,
-      replyText:
-        action.actionType === 'price_change'
-          ? `Confirmed & saved to ${shop.name}:\n${updated.name} (${updated.packSize})\nPrevious price: ${
-              updated.previousSellingPrice !== null ? formatNaira(updated.previousSellingPrice) : '—'
-            }\nNew selling price: ${formatNaira(updated.sellingPrice)}\nUpdated by ${staffMember.name} · Authorised staff notified & synced immediately.`
-          : `Confirmed & saved to ${shop.name} database:\n${updated.name} (${updated.packSize})\nSelling price: ${formatNaira(updated.sellingPrice)}\nRecorded stock: ${updated.stockQuantity} ${updated.unit}`,
+      replyText,
     };
   }
 
   // 5. Handle explicit product quick-reply selection (disambiguation)
-  if (payload.selectedProductId) {
-    const product = store.getProductInShop(shop.id, payload.selectedProductId);
+  if (resolvedSelectedProductId) {
+    const product = await store.getProductInShop(shop.id, resolvedSelectedProductId);
     if (!product) {
       return {
         status: 'ok',
+        shopId: shop.id,
+        whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
         senderName: staffMember.name,
         senderRole: staffMember.role,
         replyText: `That product could not be found in ${shop.name}'s catalogue.`,
       };
     }
 
-    store.logActivity({
+    await store.logActivity({
       shopId: shop.id,
       type: 'enquiry',
       actorName: staffMember.name,
@@ -193,33 +272,47 @@ export async function processIncomingWhatsAppEvent(
       channel: 'whatsapp',
     });
 
+    const answer = buildProductAnswer(product, shop.name);
+    await store.saveWhatsAppThread(shop.id, payload.fromPhone, {
+      history: [
+        ...thread.history,
+        { role: 'user', text: `${product.name} ${product.packSize}` },
+        { role: 'assistant', text: answer },
+      ],
+      pendingConfirmation: null,
+    });
+
     return {
       status: 'ok',
+      shopId: shop.id,
+      whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
       senderName: staffMember.name,
       senderRole: staffMember.role,
-      replyText: buildProductAnswer(product, shop.name),
+      replyText: answer,
     };
   }
 
   // 6. Grounded conversational AI using strictly this shop's live inventory + chat history
-  const shopProducts = store.getProductsForShop(shop.id);
+  const activeHistory =
+    payload.history && payload.history.length > 0 ? payload.history : thread.history;
+  const shopProducts = await store.getProductsForShop(shop.id);
   const aiResult = await generateGroundedWhatsAppReply({
     shop,
     products: shopProducts,
     staffName: staffMember.name,
     staffRole: staffMember.role,
     messageText: payload.messageText,
-    history: payload.history,
+    history: activeHistory,
   });
 
   // 7. Enforce deterministic RBAC if the user requested a price or stock mutation
   if (aiResult.requestedAction) {
     const act = aiResult.requestedAction;
-    const target = store.getProductInShop(shop.id, act.productId);
+    const target = await store.getProductInShop(shop.id, act.productId);
 
     if (target) {
       if (staffMember.role === 'attendant') {
-        store.logActivity({
+        await store.logActivity({
           shopId: shop.id,
           type: 'access_denied',
           actorName: staffMember.name,
@@ -232,8 +325,20 @@ export async function processIncomingWhatsAppEvent(
           channel: 'whatsapp',
         });
 
+        const deniedText = `Permission denied. Attendants can look up prices and stock, but only a Manager or Owner can modify ${target.name} (${target.packSize}).\nCurrent price: ${formatNaira(target.sellingPrice)} · Stock: ${target.stockQuantity} ${target.unit}.`;
+        await store.saveWhatsAppThread(shop.id, payload.fromPhone, {
+          history: [
+            ...activeHistory,
+            { role: 'user', text: trimmedText },
+            { role: 'assistant', text: deniedText },
+          ],
+          pendingConfirmation: null,
+        });
+
         return {
           status: 'ok',
+          shopId: shop.id,
+          whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
           senderName: staffMember.name,
           senderRole: staffMember.role,
           accessDenied: true,
@@ -242,7 +347,7 @@ export async function processIncomingWhatsAppEvent(
             model: aiResult.model,
             requestedAction: act,
           },
-          replyText: `Permission denied. Attendants can look up prices and stock, but only a Manager or Owner can modify ${target.name} (${target.packSize}).\nCurrent price: ${formatNaira(target.sellingPrice)} · Stock: ${target.stockQuantity} ${target.unit}.`,
+          replyText: deniedText,
         };
       }
 
@@ -255,8 +360,20 @@ export async function processIncomingWhatsAppEvent(
           reason: act.reason || `Requested via WhatsApp by ${staffMember.name}`,
         };
 
+        const confirmText = `Confirm price change for ${target.name} (${target.packSize})?\nCurrent price: ${formatNaira(target.sellingPrice)}\nNew price: ${formatNaira(pending.newPrice ?? target.sellingPrice)}\n\nTap "Confirm Update" (or reply YES) to save to ${shop.name}.`;
+        await store.saveWhatsAppThread(shop.id, payload.fromPhone, {
+          history: [
+            ...activeHistory,
+            { role: 'user', text: trimmedText },
+            { role: 'assistant', text: confirmText },
+          ],
+          pendingConfirmation: pending,
+        });
+
         return {
           status: 'ok',
+          shopId: shop.id,
+          whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
           senderName: staffMember.name,
           senderRole: staffMember.role,
           parsedIntent: {
@@ -265,7 +382,7 @@ export async function processIncomingWhatsAppEvent(
             requestedAction: act,
           },
           pendingConfirmation: pending,
-          replyText: `Confirm price change for ${target.name} (${target.packSize})?\nCurrent price: ${formatNaira(target.sellingPrice)}\nNew price: ${formatNaira(pending.newPrice ?? target.sellingPrice)}\n\nTap "Confirm Update" below to save to ${shop.name}.`,
+          replyText: confirmText,
         };
       }
 
@@ -280,8 +397,20 @@ export async function processIncomingWhatsAppEvent(
           reason: act.reason || `Adjusted via WhatsApp by ${staffMember.name}`,
         };
 
+        const confirmText = `Confirm stock update for ${target.name} (${target.packSize})?\nCurrent stock: ${target.stockQuantity} ${target.unit}\nNew stock: ${nextStock} ${target.unit}\n\nTap "Confirm Update" (or reply YES) to save.`;
+        await store.saveWhatsAppThread(shop.id, payload.fromPhone, {
+          history: [
+            ...activeHistory,
+            { role: 'user', text: trimmedText },
+            { role: 'assistant', text: confirmText },
+          ],
+          pendingConfirmation: pending,
+        });
+
         return {
           status: 'ok',
+          shopId: shop.id,
+          whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
           senderName: staffMember.name,
           senderRole: staffMember.role,
           parsedIntent: {
@@ -290,7 +419,7 @@ export async function processIncomingWhatsAppEvent(
             requestedAction: act,
           },
           pendingConfirmation: pending,
-          replyText: `Confirm stock update for ${target.name} (${target.packSize})?\nCurrent stock: ${target.stockQuantity} ${target.unit}\nNew stock: ${nextStock} ${target.unit}\n\nTap "Confirm Update" below to save.`,
+          replyText: confirmText,
         };
       }
     }
@@ -299,9 +428,10 @@ export async function processIncomingWhatsAppEvent(
   // 8. Build clickable disambiguation options if AI flagged multiple candidate sizes
   let options: WhatsAppCandidateOption[] | undefined;
   if (aiResult.ambiguousProductIds.length > 1) {
-    const candidates = aiResult.ambiguousProductIds
-      .map((id) => store.getProductInShop(shop.id, id))
-      .filter((p): p is Product => Boolean(p));
+    const candidateResults = await Promise.all(
+      aiResult.ambiguousProductIds.map((id) => store.getProductInShop(shop.id, id))
+    );
+    const candidates = candidateResults.filter((p): p is Product => Boolean(p));
 
     if (candidates.length > 1) {
       options = candidates.map((p) => ({
@@ -318,10 +448,10 @@ export async function processIncomingWhatsAppEvent(
   // 9. Log enquiry in shop activity history
   const firstRefProduct =
     aiResult.referencedProductIds.length > 0
-      ? store.getProductInShop(shop.id, aiResult.referencedProductIds[0])
+      ? await store.getProductInShop(shop.id, aiResult.referencedProductIds[0])
       : undefined;
 
-  store.logActivity({
+  await store.logActivity({
     shopId: shop.id,
     type: 'enquiry',
     actorName: staffMember.name,
@@ -341,8 +471,19 @@ export async function processIncomingWhatsAppEvent(
     channel: 'whatsapp',
   });
 
+  await store.saveWhatsAppThread(shop.id, payload.fromPhone, {
+    history: [
+      ...activeHistory,
+      { role: 'user', text: trimmedText },
+      { role: 'assistant', text: aiResult.replyText },
+    ],
+    pendingConfirmation: null,
+  });
+
   return {
     status: 'ok',
+    shopId: shop.id,
+    whatsappPhoneNumberId: shop.whatsappPhoneNumberId,
     senderName: staffMember.name,
     senderRole: staffMember.role,
     options,

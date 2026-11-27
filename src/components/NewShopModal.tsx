@@ -13,6 +13,7 @@ export function NewShopModal({ onClose, onCreated }: NewShopModalProps) {
   const [location, setLocation] = useState('');
   const [category, setCategory] = useState('Supermarket & Provisions');
   const [whatsappNumber, setWhatsappNumber] = useState('+234 805 555 0300');
+  const [whatsappPhoneNumberId, setWhatsappPhoneNumberId] = useState('');
   const [ownerName, setOwnerName] = useState('');
   const [ownerPhone, setOwnerPhone] = useState('+2348051110001');
   const [planId, setPlanId] = useState<SubscriptionPlanId>('starter');
@@ -29,6 +30,7 @@ export function NewShopModal({ onClose, onCreated }: NewShopModalProps) {
         location,
         category,
         whatsappNumber,
+        whatsappPhoneNumberId: whatsappPhoneNumberId.trim() || undefined,
         ownerName,
         ownerPhone,
         planId,
@@ -145,14 +147,28 @@ export function NewShopModal({ onClose, onCreated }: NewShopModalProps) {
             </div>
           </div>
 
-          <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">Business type</label>
-            <input
-              type="text"
-              value={category}
-              onChange={(e) => setCategory(e.target.value)}
-              className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-emerald-600"
-            />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">Business type</label>
+              <input
+                type="text"
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-emerald-600"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                Meta Phone Number ID (optional)
+              </label>
+              <input
+                type="text"
+                value={whatsappPhoneNumberId}
+                onChange={(e) => setWhatsappPhoneNumberId(e.target.value)}
+                placeholder="e.g. 543210987654321"
+                className="w-full px-3 py-2 text-sm font-mono border border-slate-200 rounded-lg focus:outline-none focus:border-emerald-600"
+              />
+            </div>
           </div>
 
           <div className="pt-2 flex items-center justify-end gap-2">

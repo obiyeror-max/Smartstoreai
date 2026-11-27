@@ -5,6 +5,8 @@ import {
   Boxes,
   Building2,
   LayoutDashboard,
+  LogIn,
+  LogOut,
   Menu,
   MessageSquare,
   Package,
@@ -14,7 +16,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import type { DashboardSnapshot, Shop } from './types';
+import type { AuthSessionResponse, AuthUser, DashboardSnapshot, Shop } from './types';
 import { api } from './lib/api';
 import { OverviewView } from './components/OverviewView';
 import { ProductsView } from './components/ProductsView';
@@ -25,6 +27,7 @@ import { ActivityView } from './components/ActivityView';
 import { WhatsAppSettingsView } from './components/WhatsAppSettingsView';
 import { WhatsAppSimulator } from './components/WhatsAppSimulator';
 import { NewShopModal } from './components/NewShopModal';
+import { AuthModal } from './components/AuthModal';
 import { LandingPage } from './components/LandingPage';
 
 type NavTab =
@@ -55,6 +58,7 @@ export default function App() {
     return 'landing';
   });
 
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [shops, setShops] = useState<Shop[]>([]);
   const [activeShopId, setActiveShopId] = useState<string>('shop_adebayo_lagos');
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
@@ -66,6 +70,7 @@ export default function App() {
   const [mobileView, setMobileView] = useState<'dashboard' | 'simulator'>('dashboard');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [showNewShopModal, setShowNewShopModal] = useState(false);
+  const [authModalMode, setAuthModalMode] = useState<'login' | 'register' | null>(null);
   const [externalPrompt, setExternalPrompt] = useState<{ id: number; text: string } | null>(null);
 
   const loadSnapshot = useCallback(async (shopId: string) => {
@@ -100,9 +105,28 @@ export default function App() {
     await loadSnapshot(shop.id);
   }
 
+  async function handleAuthenticated(session: AuthSessionResponse) {
+    api.setAuthToken(session.token);
+    setCurrentUser(session.user);
+    setShops(session.shops);
+    const firstOwned =
+      session.shops.find((s) => s.ownerUserId === session.user.id) || session.shops[0];
+    if (firstOwned) {
+      setActiveShopId(firstOwned.id);
+      await loadSnapshot(firstOwned.id);
+    }
+  }
+
+  async function handleSignOut() {
+    api.setAuthToken(null);
+    setCurrentUser(null);
+    setActiveShopId('shop_adebayo_lagos');
+    await loadSnapshot('shop_adebayo_lagos');
+  }
+
   const ownerMember =
     snapshot?.staff.find((s) => s.role === 'owner') || snapshot?.staff[0];
-  const actorName = ownerMember?.name || 'Shop Owner';
+  const actorName = currentUser?.name || ownerMember?.name || 'Shop Owner';
   const actorRole = ownerMember?.role || 'owner';
 
   const currentNavLabel =
@@ -130,10 +154,30 @@ export default function App() {
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col lg:flex-row">
       {/* Desktop Left Sidebar */}
       <aside className="hidden lg:flex lg:w-60 lg:flex-col lg:fixed lg:inset-y-0 bg-white border-r border-slate-200 z-30">
-        <div className="px-5 py-4 border-b border-slate-200">
+        <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-2">
           <span className="text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap">
             Sabi AI
           </span>
+          {currentUser ? (
+            <button
+              type="button"
+              onClick={() => void handleSignOut()}
+              title="Sign out"
+              className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 hover:text-slate-900 cursor-pointer whitespace-nowrap"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              Sign out
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setAuthModalMode('login')}
+              className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 hover:text-emerald-800 cursor-pointer whitespace-nowrap"
+            >
+              <LogIn className="w-3.5 h-3.5" />
+              Sign in
+            </button>
+          )}
         </div>
 
         {/* Multi-Tenant Shop Switcher */}
@@ -145,7 +189,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => setShowNewShopModal(true)}
-              className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-emerald-700 hover:text-emerald-800 cursor-pointer"
+              className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-emerald-700 hover:text-emerald-800 cursor-pointer whitespace-nowrap"
             >
               <Plus className="w-3 h-3" />
               New shop
@@ -161,6 +205,7 @@ export default function App() {
               {shops.map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.name}
+                  {!s.isDemo ? ' (Private)' : ''}
                 </option>
               ))}
             </select>
@@ -195,15 +240,25 @@ export default function App() {
           })}
         </nav>
 
-        {/* Plan Summary Footer */}
+        {/* Plan & Owner Account Footer */}
         <div className="px-4 py-3.5 border-t border-slate-200 text-xs text-slate-500 space-y-2.5">
           {snapshot && (
             <div>
               <p className="font-medium text-slate-700 truncate">{actorName}</p>
               <p className="capitalize">
-                {snapshot.shop.planId.replace('_', '-')} plan · Isolated DB
+                {snapshot.shop.planId.replace('_', '-')} plan ·{' '}
+                {snapshot.shop.isDemo ? 'Demo DB' : 'Private DB'}
               </p>
             </div>
+          )}
+          {!currentUser && (
+            <button
+              type="button"
+              onClick={() => setAuthModalMode('register')}
+              className="w-full py-1.5 px-3 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 cursor-pointer whitespace-nowrap"
+            >
+              Save my private shop
+            </button>
           )}
           <button
             type="button"
@@ -294,6 +349,7 @@ export default function App() {
                 {shops.map((s) => (
                   <option key={s.id} value={s.id}>
                     {s.name}
+                    {!s.isDemo ? ' (Private)' : ''}
                   </option>
                 ))}
               </select>
@@ -321,7 +377,31 @@ export default function App() {
                 );
               })}
             </nav>
-            <div className="mt-auto p-4 border-t border-slate-200">
+            <div className="mt-auto p-4 border-t border-slate-200 space-y-3">
+              {currentUser ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    void handleSignOut();
+                  }}
+                  className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-700 cursor-pointer"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  Sign out ({currentUser.name})
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    setAuthModalMode('register');
+                  }}
+                  className="w-full py-2 px-3 text-xs font-semibold text-white bg-slate-900 rounded-lg cursor-pointer"
+                >
+                  Sign in / Save private shop
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
@@ -479,6 +559,14 @@ export default function App() {
         <NewShopModal
           onClose={() => setShowNewShopModal(false)}
           onCreated={handleShopCreated}
+        />
+      )}
+
+      {authModalMode && (
+        <AuthModal
+          initialMode={authModalMode}
+          onClose={() => setAuthModalMode(null)}
+          onAuthenticated={handleAuthenticated}
         />
       )}
     </div>

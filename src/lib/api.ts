@@ -1,12 +1,15 @@
 import type {
+  AuthSessionResponse,
+  AuthUser,
   DashboardSnapshot,
+  HealthStatusResponse,
   PendingConfirmation,
   Product,
   PurchaseRecord,
   Shop,
+  StaffCountRange,
   StaffMember,
   StaffRole,
-  StaffCountRange,
   StockAdjustmentReason,
   StockLossRecord,
   StoreCategoryOption,
@@ -15,10 +18,22 @@ import type {
   WaitlistSummary,
 } from '../types';
 
+let inMemoryAuthToken: string | null = null;
+
 async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (inMemoryAuthToken) {
+    headers.Authorization = `Bearer ${inMemoryAuthToken}`;
+  }
+  if (options?.headers && typeof options.headers === 'object' && !Array.isArray(options.headers)) {
+    Object.assign(headers, options.headers as Record<string, string>);
+  }
+
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers,
   });
   const text = await res.text();
   let data: Record<string, unknown> | null = null;
@@ -43,12 +58,41 @@ async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  getHealth(): Promise<{
-    ok: boolean;
-    service: string;
-    ai: { provider: 'groq' | 'gemini'; textModel: string; audioModel: string };
-  }> {
+  setAuthToken(token: string | null) {
+    inMemoryAuthToken = token;
+  },
+
+  getHealth(): Promise<HealthStatusResponse> {
     return requestJson('/api/health');
+  },
+
+  register(payload: {
+    name: string;
+    email: string;
+    password: string;
+    shopName?: string;
+    location?: string;
+    category?: string;
+    whatsappNumber?: string;
+    whatsappPhoneNumberId?: string;
+    ownerPhone?: string;
+    planId?: SubscriptionPlanId;
+  }): Promise<AuthSessionResponse> {
+    return requestJson('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  login(payload: { email: string; password: string }): Promise<AuthSessionResponse> {
+    return requestJson('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  getMe(): Promise<{ user: AuthUser; shops: Shop[] }> {
+    return requestJson('/api/auth/me');
   },
 
   getWaitlistSummary(): Promise<WaitlistSummary> {
@@ -83,6 +127,7 @@ export const api = {
     location: string;
     category: string;
     whatsappNumber: string;
+    whatsappPhoneNumberId?: string;
     ownerName: string;
     ownerPhone: string;
     planId: SubscriptionPlanId;
@@ -95,7 +140,12 @@ export const api = {
 
   updateShopConfig(
     shopId: string,
-    payload: Partial<Pick<Shop, 'whatsappNumber' | 'whatsappConnected' | 'planId' | 'name' | 'location'>>
+    payload: Partial<
+      Pick<
+        Shop,
+        'whatsappNumber' | 'whatsappPhoneNumberId' | 'whatsappConnected' | 'planId' | 'name' | 'location'
+      >
+    >
   ): Promise<{ shop: Shop }> {
     return requestJson(`/api/shops/${encodeURIComponent(shopId)}/config`, {
       method: 'PATCH',

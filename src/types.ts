@@ -11,12 +11,45 @@ export type StockAdjustmentReason =
   | 'stock_count_variance'
   | 'correction';
 
+export interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+  createdAt: string;
+}
+
+export interface AuthSessionResponse {
+  token: string;
+  user: AuthUser;
+  shops: Shop[];
+}
+
+export interface HealthStatusResponse {
+  ok: boolean;
+  service: string;
+  database: 'supabase' | 'local';
+  ai: {
+    provider: 'groq' | 'gemini';
+    textModel: string;
+    audioModel: string;
+  };
+  whatsapp: {
+    accessTokenConfigured: boolean;
+    verifyTokenConfigured: boolean;
+    appSecretConfigured: boolean;
+    defaultPhoneNumberIdConfigured: boolean;
+  };
+}
+
 export interface Shop {
   id: string;
+  ownerUserId?: string | null;
+  isDemo?: boolean;
   name: string;
   location: string;
   category: string;
   whatsappNumber: string;
+  whatsappPhoneNumberId?: string | null;
   whatsappConnected: boolean;
   planId: SubscriptionPlanId;
   createdAt: string;
@@ -219,4 +252,3 @@ export interface WaitlistJoinResponse {
   totalCount: number;
   alreadyJoined: boolean;
 }
-

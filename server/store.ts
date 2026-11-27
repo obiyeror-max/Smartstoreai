@@ -1,16 +1,20 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { getSupabaseAdmin } from './supabaseClient.ts';
 import { syncWaitlistExcelFile } from './waitlistExcel.ts';
+import type { ChatHistoryTurn } from './ai.ts';
 import type {
   ActivityLog,
+  AuthUser,
+  PendingConfirmation,
   Product,
   PurchaseRecord,
   Shop,
+  StaffCountRange,
   StaffMember,
   StaffNotification,
   StaffRole,
-  StaffCountRange,
   StockAdjustmentReason,
   StockLossRecord,
   StoreCategoryOption,
@@ -20,7 +24,25 @@ import type {
   WaitlistSummary,
 } from '../src/types.ts';
 
+interface StoredUserAccount {
+  id: string;
+  name: string;
+  email: string;
+  passwordHash: string;
+  createdAt: string;
+}
+
+export interface WhatsAppThreadState {
+  threadKey: string;
+  shopId: string;
+  phone: string;
+  history: ChatHistoryTurn[];
+  pendingConfirmation: PendingConfirmation | null;
+  updatedAt: string;
+}
+
 interface DatabaseState {
+  users: StoredUserAccount[];
   shops: Shop[];
   products: Product[];
   staff: StaffMember[];
@@ -30,6 +52,7 @@ interface DatabaseState {
   notifications: StaffNotification[];
   processedMessageIds: string[];
   waitlist: WaitlistEntry[];
+  whatsappThreads: Record<string, WhatsAppThreadState>;
 }
 
 const DATA_DIR =
@@ -51,6 +74,35 @@ function daysFromNowDate(days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
+export function normalizePhoneDisplay(phone: string): string {
+  return phone.replace(/[\s\-()]/g, '').trim();
+}
+
+export function canonicalPhoneKey(phone: string): string {
+  const digits = phone.replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.length === 11 && digits.startsWith('0')) {
+    return `234${digits.slice(1)}`;
+  }
+  return digits;
+}
+
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${derived}`;
+}
+
+function verifyPassword(password: string, storedHash: string): boolean {
+  const parts = storedHash.split(':');
+  if (parts.length !== 2) return false;
+  const [salt, expectedHex] = parts;
+  if (!salt || !expectedHex) return false;
+  const derivedHex = crypto.scryptSync(password, salt, 64).toString('hex');
+  if (derivedHex.length !== expectedHex.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(derivedHex, 'utf8'), Buffer.from(expectedHex, 'utf8'));
+}
+
 function createSeedState(): DatabaseState {
   const shop1Id = 'shop_adebayo_lagos';
   const shop2Id = 'shop_zainab_abuja';
@@ -58,20 +110,26 @@ function createSeedState(): DatabaseState {
   const shops: Shop[] = [
     {
       id: shop1Id,
+      ownerUserId: null,
+      isDemo: true,
       name: 'Adebayo Provisions & Supermarket',
       location: 'Surulere, Lagos',
       category: 'Supermarket & Provisions',
       whatsappNumber: '+234 803 555 0100',
+      whatsappPhoneNumberId: null,
       whatsappConnected: true,
       planId: 'growth',
       createdAt: hoursAgo(240),
     },
     {
       id: shop2Id,
+      ownerUserId: null,
+      isDemo: true,
       name: 'Zainab Fresh Mart',
       location: 'Wuse II, Abuja',
       category: 'Mini-Mart & Groceries',
       whatsappNumber: '+234 809 555 0200',
+      whatsappPhoneNumberId: null,
       whatsappConnected: true,
       planId: 'multi_branch',
       createdAt: hoursAgo(180),
@@ -155,7 +213,7 @@ function createSeedState(): DatabaseState {
       stockQuantity: 28,
       unit: 'tins',
       reorderLevel: 12,
-      expiryDate: daysFromNowDate(16), // Approaching expiry!
+      expiryDate: daysFromNowDate(16),
       priceReviewFlag: false,
       updatedAt: hoursAgo(3),
       updatedBy: 'Adebayo Ogunleye',
@@ -175,7 +233,7 @@ function createSeedState(): DatabaseState {
       stockQuantity: 3,
       unit: 'packs',
       reorderLevel: 6,
-      expiryDate: daysFromNowDate(21), // Approaching expiry!
+      expiryDate: daysFromNowDate(21),
       priceReviewFlag: true,
       priceReviewReason: 'Supplier cost rose from ₦4,600 to ₦5,100 (margin dropped to 5.6%)',
       updatedAt: minutesAgo(18),
@@ -256,7 +314,7 @@ function createSeedState(): DatabaseState {
       stockQuantity: 11,
       unit: 'bags',
       reorderLevel: 4,
-      expiryDate: daysFromNowDate(-4), // Expired batch alert!
+      expiryDate: daysFromNowDate(-4),
       priceReviewFlag: false,
       updatedAt: hoursAgo(6),
       updatedBy: 'Tunde Bakare',
@@ -341,8 +399,6 @@ function createSeedState(): DatabaseState {
       updatedAt: hoursAgo(14),
       updatedBy: 'Adebayo Ogunleye',
     },
-
-    // Shop 2: Zainab Fresh Mart (Abuja)
     {
       id: 'prod_z_milo_400',
       shopId: shop2Id,
@@ -659,6 +715,7 @@ function createSeedState(): DatabaseState {
   ];
 
   return {
+    users: [],
     shops,
     products,
     staff,
@@ -668,10 +725,17 @@ function createSeedState(): DatabaseState {
     notifications,
     processedMessageIds: [],
     waitlist: [],
+    whatsappThreads: {},
   };
 }
 
-function migrateProduct(p: Partial<Product> & Pick<Product, 'id' | 'shopId' | 'name' | 'sellingPrice' | 'stockQuantity' | 'unit' | 'reorderLevel' | 'updatedAt' | 'updatedBy'>): Product {
+function migrateProduct(
+  p: Partial<Product> &
+    Pick<
+      Product,
+      'id' | 'shopId' | 'name' | 'sellingPrice' | 'stockQuantity' | 'unit' | 'reorderLevel' | 'updatedAt' | 'updatedBy'
+    >
+): Product {
   return {
     id: p.id,
     shopId: p.shopId,
@@ -695,23 +759,289 @@ function migrateProduct(p: Partial<Product> & Pick<Product, 'id' | 'shopId' | 'n
   };
 }
 
+// ---------- Supabase Row Mappers ----------
+function rowToShop(row: Record<string, unknown>): Shop {
+  return {
+    id: String(row.id),
+    ownerUserId: row.owner_user_id ? String(row.owner_user_id) : null,
+    isDemo: Boolean(row.is_demo),
+    name: String(row.name),
+    location: String(row.location),
+    category: String(row.category || 'Supermarket & Provisions'),
+    whatsappNumber: String(row.whatsapp_number),
+    whatsappPhoneNumberId: row.whatsapp_phone_number_id
+      ? String(row.whatsapp_phone_number_id)
+      : null,
+    whatsappConnected: row.whatsapp_connected !== false,
+    planId: (String(row.plan_id || 'starter') as SubscriptionPlanId),
+    createdAt: String(row.created_at),
+  };
+}
+
+function shopToRow(shop: Shop) {
+  return {
+    id: shop.id,
+    owner_user_id: shop.ownerUserId ?? null,
+    is_demo: Boolean(shop.isDemo),
+    name: shop.name,
+    location: shop.location,
+    category: shop.category,
+    whatsapp_number: shop.whatsappNumber,
+    whatsapp_phone_number_id: shop.whatsappPhoneNumberId ?? null,
+    whatsapp_connected: shop.whatsappConnected,
+    plan_id: shop.planId,
+    created_at: shop.createdAt,
+  };
+}
+
+function rowToProduct(row: Record<string, unknown>): Product {
+  return {
+    id: String(row.id),
+    shopId: String(row.shop_id),
+    name: String(row.name),
+    packSize: String(row.pack_size),
+    sku: String(row.sku),
+    category: String(row.category || 'General'),
+    costPrice: Number(row.cost_price ?? 0),
+    sellingPrice: Number(row.selling_price ?? 0),
+    previousSellingPrice:
+      row.previous_selling_price !== null && row.previous_selling_price !== undefined
+        ? Number(row.previous_selling_price)
+        : null,
+    lastPriceUpdateAt: String(row.last_price_update_at),
+    supplierName: String(row.supplier_name || 'General Distributor'),
+    stockQuantity: Number(row.stock_quantity ?? 0),
+    unit: String(row.unit || 'units'),
+    reorderLevel: Number(row.reorder_level ?? 5),
+    expiryDate: row.expiry_date ? String(row.expiry_date) : null,
+    priceReviewFlag: Boolean(row.price_review_flag),
+    priceReviewReason: row.price_review_reason ? String(row.price_review_reason) : undefined,
+    updatedAt: String(row.updated_at),
+    updatedBy: String(row.updated_by),
+  };
+}
+
+function productToRow(p: Product) {
+  return {
+    id: p.id,
+    shop_id: p.shopId,
+    name: p.name,
+    pack_size: p.packSize,
+    sku: p.sku,
+    category: p.category,
+    cost_price: p.costPrice,
+    selling_price: p.sellingPrice,
+    previous_selling_price: p.previousSellingPrice,
+    last_price_update_at: p.lastPriceUpdateAt,
+    supplier_name: p.supplierName,
+    stock_quantity: p.stockQuantity,
+    unit: p.unit,
+    reorder_level: p.reorderLevel,
+    expiry_date: p.expiryDate,
+    price_review_flag: p.priceReviewFlag,
+    price_review_reason: p.priceReviewReason ?? null,
+    updated_at: p.updatedAt,
+    updated_by: p.updatedBy,
+  };
+}
+
+function rowToStaff(row: Record<string, unknown>): StaffMember {
+  return {
+    id: String(row.id),
+    shopId: String(row.shop_id),
+    name: String(row.name),
+    phone: String(row.phone),
+    role: String(row.role) as StaffRole,
+    active: row.active !== false,
+    createdAt: String(row.created_at),
+  };
+}
+
+function staffToRow(m: StaffMember) {
+  return {
+    id: m.id,
+    shop_id: m.shopId,
+    name: m.name,
+    phone: m.phone,
+    role: m.role,
+    active: m.active,
+    created_at: m.createdAt,
+  };
+}
+
+function rowToPurchase(row: Record<string, unknown>): PurchaseRecord {
+  return {
+    id: String(row.id),
+    shopId: String(row.shop_id),
+    productId: String(row.product_id),
+    productName: String(row.product_name),
+    supplierName: String(row.supplier_name),
+    quantity: Number(row.quantity),
+    unit: String(row.unit),
+    unitCost: Number(row.unit_cost),
+    previousCostPrice: Number(row.previous_cost_price),
+    totalCost: Number(row.total_cost),
+    costIncreased: Boolean(row.cost_increased),
+    note: row.note ? String(row.note) : undefined,
+    recordedBy: String(row.recorded_by),
+    createdAt: String(row.created_at),
+  };
+}
+
+function purchaseToRow(p: PurchaseRecord) {
+  return {
+    id: p.id,
+    shop_id: p.shopId,
+    product_id: p.productId,
+    product_name: p.productName,
+    supplier_name: p.supplierName,
+    quantity: p.quantity,
+    unit: p.unit,
+    unit_cost: p.unitCost,
+    previous_cost_price: p.previousCostPrice,
+    total_cost: p.totalCost,
+    cost_increased: p.costIncreased,
+    note: p.note ?? null,
+    recorded_by: p.recordedBy,
+    created_at: p.createdAt,
+  };
+}
+
+function rowToLoss(row: Record<string, unknown>): StockLossRecord {
+  return {
+    id: String(row.id),
+    shopId: String(row.shop_id),
+    productId: String(row.product_id),
+    productName: String(row.product_name),
+    lossType: String(row.loss_type) as StockLossRecord['lossType'],
+    quantity: Number(row.quantity),
+    unit: String(row.unit),
+    unitCost: Number(row.unit_cost),
+    estimatedLossValue: Number(row.estimated_loss_value),
+    reason: String(row.reason),
+    recordedBy: String(row.recorded_by),
+    createdAt: String(row.created_at),
+  };
+}
+
+function lossToRow(l: StockLossRecord) {
+  return {
+    id: l.id,
+    shop_id: l.shopId,
+    product_id: l.productId,
+    product_name: l.productName,
+    loss_type: l.lossType,
+    quantity: l.quantity,
+    unit: l.unit,
+    unit_cost: l.unitCost,
+    estimated_loss_value: l.estimatedLossValue,
+    reason: l.reason,
+    recorded_by: l.recordedBy,
+    created_at: l.createdAt,
+  };
+}
+
+function rowToNotification(row: Record<string, unknown>): StaffNotification {
+  return {
+    id: String(row.id),
+    shopId: String(row.shop_id),
+    type: String(row.type) as StaffNotification['type'],
+    title: String(row.title),
+    message: String(row.message),
+    actorName: String(row.actor_name),
+    read: Boolean(row.read),
+    createdAt: String(row.created_at),
+  };
+}
+
+function notificationToRow(n: StaffNotification) {
+  return {
+    id: n.id,
+    shop_id: n.shopId,
+    type: n.type,
+    title: n.title,
+    message: n.message,
+    actor_name: n.actorName,
+    read: n.read,
+    created_at: n.createdAt,
+  };
+}
+
+function rowToActivity(row: Record<string, unknown>): ActivityLog {
+  return {
+    id: String(row.id),
+    shopId: String(row.shop_id),
+    type: String(row.type) as ActivityLog['type'],
+    actorName: String(row.actor_name),
+    actorRole: String(row.actor_role) as ActivityLog['actorRole'],
+    actorPhone: row.actor_phone ? String(row.actor_phone) : undefined,
+    productId: row.product_id ? String(row.product_id) : undefined,
+    productName: row.product_name ? String(row.product_name) : undefined,
+    summary: String(row.summary),
+    detail: row.detail ? String(row.detail) : undefined,
+    channel: (String(row.channel || 'dashboard') as 'dashboard' | 'whatsapp'),
+    createdAt: String(row.created_at),
+  };
+}
+
+function activityToRow(a: ActivityLog) {
+  return {
+    id: a.id,
+    shop_id: a.shopId,
+    type: a.type,
+    actor_name: a.actorName,
+    actor_role: a.actorRole,
+    actor_phone: a.actorPhone ?? null,
+    product_id: a.productId ?? null,
+    product_name: a.productName ?? null,
+    summary: a.summary,
+    detail: a.detail ?? null,
+    channel: a.channel,
+    created_at: a.createdAt,
+  };
+}
+
+function rowToWaitlist(row: Record<string, unknown>): WaitlistEntry {
+  return {
+    id: String(row.id),
+    fullName: String(row.full_name),
+    shopName: String(row.shop_name),
+    city: String(row.city),
+    email: String(row.email || ''),
+    whatsappNumber: String(row.whatsapp_number || ''),
+    storeCategory: String(row.store_category || 'Supermarket') as StoreCategoryOption,
+    staffCountRange: String(row.staff_count_range || '1-3') as StaffCountRange,
+    createdAt: String(row.created_at),
+  };
+}
+
 class SmartStoreRepository {
   private state: DatabaseState;
+  private supabaseSeedPromise: Promise<void> | null = null;
 
   constructor() {
-    this.state = this.load();
+    this.state = this.loadLocal();
     void syncWaitlistExcelFile(this.state.waitlist);
   }
 
-  private load(): DatabaseState {
+  private loadLocal(): DatabaseState {
     try {
       if (fs.existsSync(DB_FILE)) {
         const raw = fs.readFileSync(DB_FILE, 'utf-8');
         const parsed = JSON.parse(raw) as Partial<DatabaseState>;
         if (parsed && Array.isArray(parsed.shops) && Array.isArray(parsed.products)) {
           const seed = createSeedState();
-          const migrated: DatabaseState = {
-            shops: parsed.shops,
+          return {
+            users: Array.isArray(parsed.users) ? parsed.users : [],
+            shops: parsed.shops.map((s) => ({
+              ...s,
+              isDemo:
+                s.isDemo !== undefined
+                  ? s.isDemo
+                  : s.id === 'shop_adebayo_lagos' || s.id === 'shop_zainab_abuja',
+              ownerUserId: s.ownerUserId ?? null,
+              whatsappPhoneNumberId: s.whatsappPhoneNumberId ?? null,
+            })),
             products: parsed.products.map((p) => migrateProduct(p)),
             staff: parsed.staff || [],
             activities: parsed.activities || [],
@@ -720,83 +1050,314 @@ class SmartStoreRepository {
             notifications: parsed.notifications || seed.notifications,
             processedMessageIds: parsed.processedMessageIds || [],
             waitlist: Array.isArray(parsed.waitlist) ? parsed.waitlist : seed.waitlist,
+            whatsappThreads: parsed.whatsappThreads || {},
           };
-          return migrated;
         }
       }
     } catch (err) {
       console.error('Failed to load store file, recreating seed state:', err);
     }
     const seed = createSeedState();
-    this.persist(seed);
+    this.persistLocal(seed);
     return seed;
   }
 
-  private persist(nextState: DatabaseState = this.state): void {
+  private persistLocal(nextState: DatabaseState = this.state): void {
     try {
       fs.mkdirSync(DATA_DIR, { recursive: true });
       const tmpFile = `${DB_FILE}.tmp`;
       fs.writeFileSync(tmpFile, JSON.stringify(nextState, null, 2), 'utf-8');
       fs.renameSync(tmpFile, DB_FILE);
     } catch (err) {
-      console.warn('Could not persist state to disk (continuing in-memory):', err);
+      console.warn('Could not persist local state to disk (continuing in-memory):', err);
     }
   }
 
+  private async ensureSupabaseSeeded(): Promise<void> {
+    const sb = getSupabaseAdmin();
+    if (!sb) return;
+    if (this.supabaseSeedPromise) {
+      await this.supabaseSeedPromise;
+      return;
+    }
+
+    this.supabaseSeedPromise = (async () => {
+      const { count, error } = await sb
+        .from('shops')
+        .select('id', { count: 'exact', head: true });
+
+      if (error) {
+        console.error('Supabase shops check failed:', error.message);
+        throw new Error(`Supabase error: ${error.message}. Make sure you ran supabase/schema.sql.`);
+      }
+
+      if ((count ?? 0) === 0) {
+        const seed = createSeedState();
+        await sb.from('shops').upsert(seed.shops.map(shopToRow));
+        await sb.from('products').upsert(seed.products.map(productToRow));
+        await sb.from('staff').upsert(seed.staff.map(staffToRow));
+        await sb.from('purchases').upsert(seed.purchases.map(purchaseToRow));
+        await sb.from('stock_losses').upsert(seed.stockLosses.map(lossToRow));
+        await sb.from('staff_notifications').upsert(seed.notifications.map(notificationToRow));
+        await sb.from('activities').upsert(seed.activities.map(activityToRow));
+      }
+    })().catch((err) => {
+      this.supabaseSeedPromise = null;
+      throw err;
+    });
+
+    await this.supabaseSeedPromise;
+  }
+
   public normalizePhone(phone: string): string {
-    return phone.replace(/[\s\-()]/g, '').trim();
+    return normalizePhoneDisplay(phone);
   }
 
-  public getAllShops(): Shop[] {
-    return this.state.shops;
+  // ---------- User Accounts (Owner Auth) ----------
+  public async registerUserAccount(input: {
+    name: string;
+    email: string;
+    password: string;
+  }): Promise<{ user?: AuthUser; error?: string }> {
+    const cleanEmail = input.email.trim().toLowerCase();
+    const cleanName = input.name.trim();
+    if (!cleanName || !cleanEmail || input.password.length < 6) {
+      return { error: 'Name, valid email, and a password of at least 6 characters are required.' };
+    }
+
+    const userRecord: StoredUserAccount = {
+      id: `usr_${crypto.randomUUID().slice(0, 12)}`,
+      name: cleanName,
+      email: cleanEmail,
+      passwordHash: hashPassword(input.password),
+      createdAt: new Date().toISOString(),
+    };
+
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await this.ensureSupabaseSeeded();
+      const { data: existing } = await sb
+        .from('app_users')
+        .select('id')
+        .eq('email', cleanEmail)
+        .maybeSingle();
+
+      if (existing) {
+        return { error: 'An account with this email already exists. Please sign in.' };
+      }
+
+      const { error } = await sb.from('app_users').insert({
+        id: userRecord.id,
+        name: userRecord.name,
+        email: userRecord.email,
+        password_hash: userRecord.passwordHash,
+        created_at: userRecord.createdAt,
+      });
+
+      if (error) {
+        return { error: `Could not create account: ${error.message}` };
+      }
+    } else {
+      const existing = this.state.users.find((u) => u.email === cleanEmail);
+      if (existing) {
+        return { error: 'An account with this email already exists. Please sign in.' };
+      }
+      this.state.users.push(userRecord);
+      this.persistLocal();
+    }
+
+    return {
+      user: {
+        id: userRecord.id,
+        name: userRecord.name,
+        email: userRecord.email,
+        createdAt: userRecord.createdAt,
+      },
+    };
   }
 
-  public getShopById(shopId: string): Shop | undefined {
+  public async loginUserAccount(
+    email: string,
+    password: string
+  ): Promise<{ user?: AuthUser; error?: string }> {
+    const cleanEmail = email.trim().toLowerCase();
+    const sb = getSupabaseAdmin();
+    let found: StoredUserAccount | undefined;
+
+    if (sb) {
+      await this.ensureSupabaseSeeded();
+      const { data } = await sb
+        .from('app_users')
+        .select('*')
+        .eq('email', cleanEmail)
+        .maybeSingle();
+
+      if (data) {
+        found = {
+          id: String(data.id),
+          name: String(data.name),
+          email: String(data.email),
+          passwordHash: String(data.password_hash),
+          createdAt: String(data.created_at),
+        };
+      }
+    } else {
+      found = this.state.users.find((u) => u.email === cleanEmail);
+    }
+
+    if (!found || !verifyPassword(password, found.passwordHash)) {
+      return { error: 'Invalid email or password.' };
+    }
+
+    return {
+      user: {
+        id: found.id,
+        name: found.name,
+        email: found.email,
+        createdAt: found.createdAt,
+      },
+    };
+  }
+
+  public async getUserById(userId: string): Promise<AuthUser | undefined> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      const { data } = await sb.from('app_users').select('*').eq('id', userId).maybeSingle();
+      if (!data) return undefined;
+      return {
+        id: String(data.id),
+        name: String(data.name),
+        email: String(data.email),
+        createdAt: String(data.created_at),
+      };
+    }
+
+    const found = this.state.users.find((u) => u.id === userId);
+    if (!found) return undefined;
+    return {
+      id: found.id,
+      name: found.name,
+      email: found.email,
+      createdAt: found.createdAt,
+    };
+  }
+
+  // ---------- Shops ----------
+  public async getAccessibleShops(userId?: string): Promise<Shop[]> {
+    const sb = getSupabaseAdmin();
+    let shops: Shop[];
+
+    if (sb) {
+      await this.ensureSupabaseSeeded();
+      const { data } = await sb.from('shops').select('*').order('created_at', { ascending: true });
+      shops = (data || []).map((r) => rowToShop(r as Record<string, unknown>));
+    } else {
+      shops = [...this.state.shops];
+    }
+
+    const filtered = shops.filter(
+      (s) => s.isDemo || (userId && s.ownerUserId && s.ownerUserId === userId)
+    );
+    // Put user's own shops first if signed in
+    if (userId) {
+      filtered.sort((a, b) => {
+        const aOwn = a.ownerUserId === userId ? 0 : 1;
+        const bOwn = b.ownerUserId === userId ? 0 : 1;
+        return aOwn - bOwn;
+      });
+    }
+    return filtered;
+  }
+
+  public async getShopById(shopId: string): Promise<Shop | undefined> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await this.ensureSupabaseSeeded();
+      const { data } = await sb.from('shops').select('*').eq('id', shopId).maybeSingle();
+      return data ? rowToShop(data as Record<string, unknown>) : undefined;
+    }
     return this.state.shops.find((s) => s.id === shopId);
   }
 
-  public getShopByWhatsappNumber(phone: string): Shop | undefined {
-    const normalized = this.normalizePhone(phone);
-    return this.state.shops.find(
-      (s) => this.normalizePhone(s.whatsappNumber) === normalized
-    );
+  public async getShopByWhatsappIdentity(params: {
+    shopId?: string;
+    phoneNumberId?: string;
+    toBusinessPhone?: string;
+  }): Promise<Shop | undefined> {
+    if (params.shopId) {
+      return this.getShopById(params.shopId);
+    }
+
+    const sb = getSupabaseAdmin();
+    let shops: Shop[];
+    if (sb) {
+      await this.ensureSupabaseSeeded();
+      const { data } = await sb.from('shops').select('*');
+      shops = (data || []).map((r) => rowToShop(r as Record<string, unknown>));
+    } else {
+      shops = this.state.shops;
+    }
+
+    if (params.phoneNumberId) {
+      const byPid = shops.find((s) => s.whatsappPhoneNumberId === params.phoneNumberId);
+      if (byPid) return byPid;
+    }
+
+    if (params.toBusinessPhone) {
+      const targetKey = canonicalPhoneKey(params.toBusinessPhone);
+      const byPhone = shops.find((s) => canonicalPhoneKey(s.whatsappNumber) === targetKey);
+      if (byPhone) return byPhone;
+    }
+
+    // Fallback: if single default WHATSAPP_PHONE_NUMBER_ID matches or user only has 1 WhatsApp-connected shop
+    if (params.phoneNumberId && process.env.WHATSAPP_PHONE_NUMBER_ID?.trim() === params.phoneNumberId) {
+      const nonDemo = shops.find((s) => !s.isDemo && s.whatsappConnected);
+      if (nonDemo) return nonDemo;
+      return shops.find((s) => s.whatsappConnected);
+    }
+
+    return undefined;
   }
 
-  public createShop(input: {
+  public async createShop(input: {
+    ownerUserId?: string | null;
+    isDemo?: boolean;
     name: string;
     location: string;
     category: string;
     whatsappNumber: string;
+    whatsappPhoneNumberId?: string | null;
     ownerName: string;
     ownerPhone: string;
     planId: SubscriptionPlanId;
-  }): Shop {
+  }): Promise<Shop> {
     const id = `shop_${crypto.randomUUID().slice(0, 8)}`;
     const now = new Date().toISOString();
     const shop: Shop = {
       id,
+      ownerUserId: input.ownerUserId ?? null,
+      isDemo: input.isDemo !== undefined ? input.isDemo : !input.ownerUserId,
       name: input.name.trim(),
       location: input.location.trim(),
       category: input.category.trim() || 'Supermarket & Provisions',
       whatsappNumber: input.whatsappNumber.trim(),
+      whatsappPhoneNumberId: input.whatsappPhoneNumberId?.trim() || null,
       whatsappConnected: true,
       planId: input.planId || 'starter',
       createdAt: now,
     };
-    this.state.shops.push(shop);
 
     const owner: StaffMember = {
       id: `staff_${crypto.randomUUID().slice(0, 8)}`,
       shopId: id,
       name: input.ownerName.trim(),
-      phone: this.normalizePhone(input.ownerPhone),
+      phone: normalizePhoneDisplay(input.ownerPhone),
       role: 'owner',
       active: true,
       createdAt: now,
     };
-    this.state.staff.push(owner);
 
-    this.state.activities.unshift({
+    const activity: ActivityLog = {
       id: `act_${crypto.randomUUID().slice(0, 8)}`,
       shopId: id,
       type: 'staff_updated',
@@ -806,22 +1367,45 @@ class SmartStoreRepository {
       detail: `Connected WhatsApp Business number ${shop.whatsappNumber}`,
       channel: 'dashboard',
       createdAt: now,
-    });
+    };
 
-    this.persist();
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await this.ensureSupabaseSeeded();
+      await sb.from('shops').insert(shopToRow(shop));
+      await sb.from('staff').insert(staffToRow(owner));
+      await sb.from('activities').insert(activityToRow(activity));
+    } else {
+      this.state.shops.push(shop);
+      this.state.staff.push(owner);
+      this.state.activities.unshift(activity);
+      this.persistLocal();
+    }
+
     return shop;
   }
 
-  public updateShopConfig(
+  public async updateShopConfig(
     shopId: string,
-    patch: Partial<Pick<Shop, 'whatsappNumber' | 'whatsappConnected' | 'planId' | 'name' | 'location'>>
-  ): Shop | undefined {
-    const shop = this.getShopById(shopId);
+    patch: Partial<
+      Pick<
+        Shop,
+        'whatsappNumber' | 'whatsappPhoneNumberId' | 'whatsappConnected' | 'planId' | 'name' | 'location'
+      >
+    >
+  ): Promise<Shop | undefined> {
+    const shop = await this.getShopById(shopId);
     if (!shop) return undefined;
+
     if (typeof patch.name === 'string' && patch.name.trim()) shop.name = patch.name.trim();
     if (typeof patch.location === 'string' && patch.location.trim()) shop.location = patch.location.trim();
     if (typeof patch.whatsappNumber === 'string' && patch.whatsappNumber.trim()) {
       shop.whatsappNumber = patch.whatsappNumber.trim();
+    }
+    if (patch.whatsappPhoneNumberId !== undefined) {
+      shop.whatsappPhoneNumberId = patch.whatsappPhoneNumberId
+        ? patch.whatsappPhoneNumberId.trim()
+        : null;
     }
     if (typeof patch.whatsappConnected === 'boolean') {
       shop.whatsappConnected = patch.whatsappConnected;
@@ -829,21 +1413,51 @@ class SmartStoreRepository {
     if (patch.planId) {
       shop.planId = patch.planId;
     }
-    this.persist();
+
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('shops').update(shopToRow(shop)).eq('id', shopId);
+    } else {
+      const idx = this.state.shops.findIndex((s) => s.id === shopId);
+      if (idx !== -1) this.state.shops[idx] = shop;
+      this.persistLocal();
+    }
     return shop;
   }
 
-  public getProductsForShop(shopId: string): Product[] {
+  // ---------- Products ----------
+  public async getProductsForShop(shopId: string): Promise<Product[]> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await this.ensureSupabaseSeeded();
+      const { data } = await sb
+        .from('products')
+        .select('*')
+        .eq('shop_id', shopId)
+        .order('name', { ascending: true });
+      return (data || []).map((r) => rowToProduct(r as Record<string, unknown>));
+    }
     return this.state.products
       .filter((p) => p.shopId === shopId)
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  public getProductInShop(shopId: string, productId: string): Product | undefined {
+  public async getProductInShop(shopId: string, productId: string): Promise<Product | undefined> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await this.ensureSupabaseSeeded();
+      const { data } = await sb
+        .from('products')
+        .select('*')
+        .eq('shop_id', shopId)
+        .eq('id', productId)
+        .maybeSingle();
+      return data ? rowToProduct(data as Record<string, unknown>) : undefined;
+    }
     return this.state.products.find((p) => p.shopId === shopId && p.id === productId);
   }
 
-  public createProduct(
+  public async createProduct(
     shopId: string,
     input: {
       name: string;
@@ -860,7 +1474,7 @@ class SmartStoreRepository {
       actorName: string;
       actorRole: StaffRole;
     }
-  ): Product {
+  ): Promise<Product> {
     const now = new Date().toISOString();
     const selling = Math.max(0, Number(input.sellingPrice));
     const cost =
@@ -888,9 +1502,8 @@ class SmartStoreRepository {
       updatedAt: now,
       updatedBy: input.actorName,
     };
-    this.state.products.push(product);
 
-    this.state.activities.unshift({
+    const activity: ActivityLog = {
       id: `act_${crypto.randomUUID().slice(0, 8)}`,
       shopId,
       type: 'product_added',
@@ -902,13 +1515,22 @@ class SmartStoreRepository {
       detail: `Cost ₦${product.costPrice.toLocaleString('en-NG')} · Stock ${product.stockQuantity} ${product.unit}`,
       channel: 'dashboard',
       createdAt: now,
-    });
+    };
 
-    this.persist();
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('products').insert(productToRow(product));
+      await sb.from('activities').insert(activityToRow(activity));
+    } else {
+      this.state.products.push(product);
+      this.state.activities.unshift(activity);
+      this.persistLocal();
+    }
+
     return product;
   }
 
-  public bulkImportProducts(
+  public async bulkImportProducts(
     shopId: string,
     items: Array<{
       name: string;
@@ -925,7 +1547,7 @@ class SmartStoreRepository {
     }>,
     actorName: string,
     actorRole: StaffRole
-  ): Product[] {
+  ): Promise<Product[]> {
     const now = new Date().toISOString();
     const created: Product[] = [];
     for (const item of items) {
@@ -935,7 +1557,7 @@ class SmartStoreRepository {
         item.costPrice !== undefined && !Number.isNaN(Number(item.costPrice))
           ? Math.max(0, Number(item.costPrice))
           : Math.round(selling * 0.85);
-      const product: Product = {
+      created.push({
         id: `prod_${crypto.randomUUID().slice(0, 8)}`,
         shopId,
         name: item.name.trim(),
@@ -954,29 +1576,37 @@ class SmartStoreRepository {
         priceReviewFlag: false,
         updatedAt: now,
         updatedBy: actorName,
-      };
-      this.state.products.push(product);
-      created.push(product);
+      });
     }
 
-    if (created.length > 0) {
-      this.state.activities.unshift({
-        id: `act_${crypto.randomUUID().slice(0, 8)}`,
-        shopId,
-        type: 'product_added',
-        actorName,
-        actorRole,
-        summary: `Imported ${created.length} products via CSV`,
-        detail: created.slice(0, 3).map((p) => p.name).join(', ') + (created.length > 3 ? '...' : ''),
-        channel: 'dashboard',
-        createdAt: now,
-      });
-      this.persist();
+    if (created.length === 0) return created;
+
+    const activity: ActivityLog = {
+      id: `act_${crypto.randomUUID().slice(0, 8)}`,
+      shopId,
+      type: 'product_added',
+      actorName,
+      actorRole,
+      summary: `Imported ${created.length} products via CSV`,
+      detail: created.slice(0, 3).map((p) => p.name).join(', ') + (created.length > 3 ? '...' : ''),
+      channel: 'dashboard',
+      createdAt: now,
+    };
+
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('products').insert(created.map(productToRow));
+      await sb.from('activities').insert(activityToRow(activity));
+    } else {
+      this.state.products.push(...created);
+      this.state.activities.unshift(activity);
+      this.persistLocal();
     }
+
     return created;
   }
 
-  public updateProduct(
+  public async updateProduct(
     shopId: string,
     productId: string,
     patch: {
@@ -996,8 +1626,8 @@ class SmartStoreRepository {
       channel?: 'dashboard' | 'whatsapp';
       reason?: string;
     }
-  ): Product | undefined {
-    const product = this.getProductInShop(shopId, productId);
+  ): Promise<Product | undefined> {
+    const product = await this.getProductInShop(shopId, productId);
     if (!product) return undefined;
 
     const now = new Date().toISOString();
@@ -1020,11 +1650,9 @@ class SmartStoreRepository {
     if (patch.expiryDate !== undefined) {
       product.expiryDate = patch.expiryDate || null;
     }
-
     if (typeof patch.costPrice === 'number' && !Number.isNaN(patch.costPrice)) {
       product.costPrice = Math.max(0, patch.costPrice);
     }
-
     if (typeof patch.sellingPrice === 'number' && !Number.isNaN(patch.sellingPrice)) {
       product.sellingPrice = Math.max(0, patch.sellingPrice);
     }
@@ -1035,11 +1663,13 @@ class SmartStoreRepository {
     product.updatedAt = now;
     product.updatedBy = patch.actorName;
 
-    // Flag price review if cost increased without selling price also changing in this edit
     if (product.costPrice > oldCost && product.sellingPrice === oldPrice) {
       product.priceReviewFlag = true;
       product.priceReviewReason = `Cost price rose from ₦${oldCost.toLocaleString('en-NG')} to ₦${product.costPrice.toLocaleString('en-NG')}`;
     }
+
+    const newActivities: ActivityLog[] = [];
+    const newNotifications: StaffNotification[] = [];
 
     if (product.sellingPrice !== oldPrice) {
       product.previousSellingPrice = oldPrice;
@@ -1047,7 +1677,7 @@ class SmartStoreRepository {
       product.priceReviewFlag = false;
       product.priceReviewReason = undefined;
 
-      this.state.activities.unshift({
+      newActivities.push({
         id: `act_${crypto.randomUUID().slice(0, 8)}`,
         shopId,
         type: 'price_change',
@@ -1061,7 +1691,7 @@ class SmartStoreRepository {
         createdAt: now,
       });
 
-      this.state.notifications.unshift({
+      newNotifications.push({
         id: `notif_${crypto.randomUUID().slice(0, 8)}`,
         shopId,
         type: 'price_change',
@@ -1076,7 +1706,7 @@ class SmartStoreRepository {
     if (product.stockQuantity !== oldStock) {
       const diff = product.stockQuantity - oldStock;
       const verb = diff > 0 ? `Added ${diff}` : `Deducted ${Math.abs(diff)}`;
-      this.state.activities.unshift({
+      newActivities.push({
         id: `act_${crypto.randomUUID().slice(0, 8)}`,
         shopId,
         type: 'stock_adjustment',
@@ -1095,13 +1725,35 @@ class SmartStoreRepository {
       });
     }
 
-    this.persist();
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('products').update(productToRow(product)).eq('id', product.id).eq('shop_id', shopId);
+      if (newActivities.length > 0) {
+        await sb.from('activities').insert(newActivities.map(activityToRow));
+      }
+      if (newNotifications.length > 0) {
+        await sb.from('staff_notifications').insert(newNotifications.map(notificationToRow));
+      }
+    } else {
+      const idx = this.state.products.findIndex((p) => p.id === product.id && p.shopId === shopId);
+      if (idx !== -1) this.state.products[idx] = product;
+      this.state.activities.unshift(...newActivities);
+      this.state.notifications.unshift(...newNotifications);
+      this.persistLocal();
+    }
+
     return product;
   }
 
-  public dismissPriceReview(shopId: string, productId: string, actorName: string, actorRole: StaffRole): Product | undefined {
-    const product = this.getProductInShop(shopId, productId);
+  public async dismissPriceReview(
+    shopId: string,
+    productId: string,
+    actorName: string,
+    actorRole: StaffRole
+  ): Promise<Product | undefined> {
+    const product = await this.getProductInShop(shopId, productId);
     if (!product) return undefined;
+
     const now = new Date().toISOString();
     product.priceReviewFlag = false;
     product.priceReviewReason = undefined;
@@ -1109,7 +1761,7 @@ class SmartStoreRepository {
     product.updatedAt = now;
     product.updatedBy = actorName;
 
-    this.state.activities.unshift({
+    const activity: ActivityLog = {
       id: `act_${crypto.randomUUID().slice(0, 8)}`,
       shopId,
       type: 'price_change',
@@ -1120,13 +1772,23 @@ class SmartStoreRepository {
       summary: `Reviewed price for ${product.name} (kept ₦${product.sellingPrice.toLocaleString('en-NG')})`,
       channel: 'dashboard',
       createdAt: now,
-    });
+    };
 
-    this.persist();
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('products').update(productToRow(product)).eq('id', product.id).eq('shop_id', shopId);
+      await sb.from('activities').insert(activityToRow(activity));
+    } else {
+      const idx = this.state.products.findIndex((p) => p.id === product.id && p.shopId === shopId);
+      if (idx !== -1) this.state.products[idx] = product;
+      this.state.activities.unshift(activity);
+      this.persistLocal();
+    }
+
     return product;
   }
 
-  public recordPurchase(
+  public async recordPurchase(
     shopId: string,
     input: {
       productId: string;
@@ -1138,8 +1800,8 @@ class SmartStoreRepository {
       actorName: string;
       actorRole: StaffRole;
     }
-  ): { product: Product; purchase: PurchaseRecord } | undefined {
-    const product = this.getProductInShop(shopId, input.productId);
+  ): Promise<{ product: Product; purchase: PurchaseRecord } | undefined> {
+    const product = await this.getProductInShop(shopId, input.productId);
     if (!product) return undefined;
 
     const now = new Date().toISOString();
@@ -1159,6 +1821,7 @@ class SmartStoreRepository {
     product.updatedAt = now;
     product.updatedBy = input.actorName;
 
+    let notification: StaffNotification | null = null;
     if (costIncreased) {
       const marginPct =
         product.sellingPrice > 0
@@ -1167,7 +1830,7 @@ class SmartStoreRepository {
       product.priceReviewFlag = true;
       product.priceReviewReason = `Supplier cost rose from ₦${prevCost.toLocaleString('en-NG')} to ₦${unitCost.toLocaleString('en-NG')} (margin now ${marginPct}%)`;
 
-      this.state.notifications.unshift({
+      notification = {
         id: `notif_${crypto.randomUUID().slice(0, 8)}`,
         shopId,
         type: 'price_review',
@@ -1176,7 +1839,7 @@ class SmartStoreRepository {
         actorName: input.actorName,
         read: false,
         createdAt: now,
-      });
+      };
     }
 
     const purchase: PurchaseRecord = {
@@ -1195,9 +1858,8 @@ class SmartStoreRepository {
       recordedBy: input.actorName,
       createdAt: now,
     };
-    this.state.purchases.unshift(purchase);
 
-    this.state.activities.unshift({
+    const activity: ActivityLog = {
       id: `act_${crypto.randomUUID().slice(0, 8)}`,
       shopId,
       type: 'purchase',
@@ -1211,24 +1873,38 @@ class SmartStoreRepository {
         : `Stock now ${product.stockQuantity} ${product.unit}`,
       channel: 'dashboard',
       createdAt: now,
-    });
+    };
 
-    this.persist();
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('products').update(productToRow(product)).eq('id', product.id).eq('shop_id', shopId);
+      await sb.from('purchases').insert(purchaseToRow(purchase));
+      await sb.from('activities').insert(activityToRow(activity));
+      if (notification) await sb.from('staff_notifications').insert(notificationToRow(notification));
+    } else {
+      const idx = this.state.products.findIndex((p) => p.id === product.id && p.shopId === shopId);
+      if (idx !== -1) this.state.products[idx] = product;
+      this.state.purchases.unshift(purchase);
+      this.state.activities.unshift(activity);
+      if (notification) this.state.notifications.unshift(notification);
+      this.persistLocal();
+    }
+
     return { product, purchase };
   }
 
-  public recordStockAdjustmentWithReason(
+  public async recordStockAdjustmentWithReason(
     shopId: string,
     input: {
       productId: string;
-      quantityDelta: number; // positive for add, negative for deduct
+      quantityDelta: number;
       reason: StockAdjustmentReason;
       note?: string;
       actorName: string;
       actorRole: StaffRole;
     }
-  ): { product: Product; loss?: StockLossRecord } | undefined {
-    const product = this.getProductInShop(shopId, input.productId);
+  ): Promise<{ product: Product; loss?: StockLossRecord } | undefined> {
+    const product = await this.getProductInShop(shopId, input.productId);
     if (!product) return undefined;
 
     const now = new Date().toISOString();
@@ -1245,6 +1921,8 @@ class SmartStoreRepository {
       input.reason === 'expired' ||
       input.reason === 'theft_or_missing' ||
       (input.reason === 'stock_count_variance' && actualDiff < 0);
+
+    let activity: ActivityLog;
 
     if (isLossReason && actualDiff < 0) {
       const lostQty = Math.abs(actualDiff);
@@ -1263,9 +1941,7 @@ class SmartStoreRepository {
         recordedBy: input.actorName,
         createdAt: now,
       };
-      this.state.stockLosses.unshift(loss);
-
-      this.state.activities.unshift({
+      activity = {
         id: `act_${crypto.randomUUID().slice(0, 8)}`,
         shopId,
         type: 'stock_loss',
@@ -1277,9 +1953,9 @@ class SmartStoreRepository {
         detail: `${oldStock} → ${nextStock} ${product.unit}${input.note ? ` · ${input.note}` : ''}`,
         channel: 'dashboard',
         createdAt: now,
-      });
+      };
     } else {
-      this.state.activities.unshift({
+      activity = {
         id: `act_${crypto.randomUUID().slice(0, 8)}`,
         shopId,
         type: 'stock_adjustment',
@@ -1291,19 +1967,31 @@ class SmartStoreRepository {
         detail: input.note?.trim() || undefined,
         channel: 'dashboard',
         createdAt: now,
-      });
+      };
     }
 
-    this.persist();
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('products').update(productToRow(product)).eq('id', product.id).eq('shop_id', shopId);
+      if (loss) await sb.from('stock_losses').insert(lossToRow(loss));
+      await sb.from('activities').insert(activityToRow(activity));
+    } else {
+      const idx = this.state.products.findIndex((p) => p.id === product.id && p.shopId === shopId);
+      if (idx !== -1) this.state.products[idx] = product;
+      if (loss) this.state.stockLosses.unshift(loss);
+      this.state.activities.unshift(activity);
+      this.persistLocal();
+    }
+
     return { product, loss };
   }
 
-  public submitPhysicalStockCount(
+  public async submitPhysicalStockCount(
     shopId: string,
     counts: Array<{ productId: string; countedQuantity: number }>,
     actorName: string,
     actorRole: StaffRole
-  ): {
+  ): Promise<{
     adjustedCount: number;
     totalVarianceUnits: number;
     totalShrinkageValue: number;
@@ -1315,7 +2003,7 @@ class SmartStoreRepository {
       variance: number;
       costImpact: number;
     }>;
-  } {
+  }> {
     const now = new Date().toISOString();
     const variances: Array<{
       productId: string;
@@ -1330,8 +2018,11 @@ class SmartStoreRepository {
     let totalVarianceUnits = 0;
     let totalShrinkageValue = 0;
 
+    const updatedProducts: Product[] = [];
+    const newLosses: StockLossRecord[] = [];
+
     for (const entry of counts) {
-      const product = this.getProductInShop(shopId, entry.productId);
+      const product = await this.getProductInShop(shopId, entry.productId);
       if (!product) continue;
       const counted = Math.max(0, Math.floor(Number(entry.countedQuantity)));
       const expected = product.stockQuantity;
@@ -1354,11 +2045,12 @@ class SmartStoreRepository {
         product.stockQuantity = counted;
         product.updatedAt = now;
         product.updatedBy = actorName;
+        updatedProducts.push(product);
 
         if (variance < 0) {
           const lossVal = Math.abs(variance) * product.costPrice;
           totalShrinkageValue += lossVal;
-          this.state.stockLosses.unshift({
+          newLosses.push({
             id: `loss_${crypto.randomUUID().slice(0, 8)}`,
             shopId,
             productId: product.id,
@@ -1376,7 +2068,7 @@ class SmartStoreRepository {
       }
     }
 
-    this.state.activities.unshift({
+    const activity: ActivityLog = {
       id: `act_${crypto.randomUUID().slice(0, 8)}`,
       shopId,
       type: 'stock_count',
@@ -1389,9 +2081,27 @@ class SmartStoreRepository {
           : 'All counted quantities reconciled cleanly',
       channel: 'dashboard',
       createdAt: now,
-    });
+    };
 
-    this.persist();
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      if (updatedProducts.length > 0) {
+        await sb.from('products').upsert(updatedProducts.map(productToRow));
+      }
+      if (newLosses.length > 0) {
+        await sb.from('stock_losses').insert(newLosses.map(lossToRow));
+      }
+      await sb.from('activities').insert(activityToRow(activity));
+    } else {
+      for (const up of updatedProducts) {
+        const idx = this.state.products.findIndex((p) => p.id === up.id && p.shopId === shopId);
+        if (idx !== -1) this.state.products[idx] = up;
+      }
+      this.state.stockLosses.unshift(...newLosses);
+      this.state.activities.unshift(activity);
+      this.persistLocal();
+    }
+
     return {
       adjustedCount,
       totalVarianceUnits,
@@ -1400,26 +2110,44 @@ class SmartStoreRepository {
     };
   }
 
-  public deleteProduct(shopId: string, productId: string): boolean {
+  public async deleteProduct(shopId: string, productId: string): Promise<boolean> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      const { data } = await sb
+        .from('products')
+        .delete()
+        .eq('shop_id', shopId)
+        .eq('id', productId)
+        .select('id');
+      return Boolean(data && data.length > 0);
+    }
+
     const idx = this.state.products.findIndex((p) => p.shopId === shopId && p.id === productId);
     if (idx === -1) return false;
     this.state.products.splice(idx, 1);
-    this.persist();
+    this.persistLocal();
     return true;
   }
 
-  public getStaffForShop(shopId: string): StaffMember[] {
+  // ---------- Staff ----------
+  public async getStaffForShop(shopId: string): Promise<StaffMember[]> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await this.ensureSupabaseSeeded();
+      const { data } = await sb.from('staff').select('*').eq('shop_id', shopId);
+      return (data || []).map((r) => rowToStaff(r as Record<string, unknown>));
+    }
     return this.state.staff.filter((s) => s.shopId === shopId);
   }
 
-  public findStaffByPhoneInShop(shopId: string, phone: string): StaffMember | undefined {
-    const normalized = this.normalizePhone(phone);
-    return this.state.staff.find(
-      (s) => s.shopId === shopId && this.normalizePhone(s.phone) === normalized
-    );
+  public async findStaffByPhoneInShop(shopId: string, phone: string): Promise<StaffMember | undefined> {
+    const targetKey = canonicalPhoneKey(phone);
+    if (!targetKey) return undefined;
+    const members = await this.getStaffForShop(shopId);
+    return members.find((s) => canonicalPhoneKey(s.phone) === targetKey);
   }
 
-  public addStaffMember(
+  public async addStaffMember(
     shopId: string,
     input: {
       name: string;
@@ -1427,20 +2155,19 @@ class SmartStoreRepository {
       role: StaffRole;
       actorName: string;
     }
-  ): StaffMember {
+  ): Promise<StaffMember> {
     const now = new Date().toISOString();
     const member: StaffMember = {
       id: `staff_${crypto.randomUUID().slice(0, 8)}`,
       shopId,
       name: input.name.trim(),
-      phone: this.normalizePhone(input.phone),
+      phone: normalizePhoneDisplay(input.phone),
       role: input.role,
       active: true,
       createdAt: now,
     };
-    this.state.staff.push(member);
 
-    this.state.activities.unshift({
+    const activity: ActivityLog = {
       id: `act_${crypto.randomUUID().slice(0, 8)}`,
       shopId,
       type: 'staff_updated',
@@ -1450,28 +2177,38 @@ class SmartStoreRepository {
       detail: `WhatsApp access number: ${member.phone}`,
       channel: 'dashboard',
       createdAt: now,
-    });
+    };
 
-    this.persist();
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('staff').insert(staffToRow(member));
+      await sb.from('activities').insert(activityToRow(activity));
+    } else {
+      this.state.staff.push(member);
+      this.state.activities.unshift(activity);
+      this.persistLocal();
+    }
+
     return member;
   }
 
-  public updateStaffMember(
+  public async updateStaffMember(
     shopId: string,
     staffId: string,
     patch: { role?: StaffRole; active?: boolean; name?: string; phone?: string; actorName: string }
-  ): StaffMember | undefined {
-    const member = this.state.staff.find((s) => s.shopId === shopId && s.id === staffId);
+  ): Promise<StaffMember | undefined> {
+    const members = await this.getStaffForShop(shopId);
+    const member = members.find((s) => s.id === staffId);
     if (!member) return undefined;
 
     if (patch.role) member.role = patch.role;
     if (typeof patch.active === 'boolean') member.active = patch.active;
     if (typeof patch.name === 'string' && patch.name.trim()) member.name = patch.name.trim();
     if (typeof patch.phone === 'string' && patch.phone.trim()) {
-      member.phone = this.normalizePhone(patch.phone);
+      member.phone = normalizePhoneDisplay(patch.phone);
     }
 
-    this.state.activities.unshift({
+    const activity: ActivityLog = {
       id: `act_${crypto.randomUUID().slice(0, 8)}`,
       shopId,
       type: 'staff_updated',
@@ -1480,69 +2217,220 @@ class SmartStoreRepository {
       summary: `Updated ${member.name} (${member.role} · ${member.active ? 'Active' : 'Suspended'})`,
       channel: 'dashboard',
       createdAt: new Date().toISOString(),
-    });
+    };
 
-    this.persist();
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('staff').update(staffToRow(member)).eq('id', staffId).eq('shop_id', shopId);
+      await sb.from('activities').insert(activityToRow(activity));
+    } else {
+      const idx = this.state.staff.findIndex((s) => s.id === staffId && s.shopId === shopId);
+      if (idx !== -1) this.state.staff[idx] = member;
+      this.state.activities.unshift(activity);
+      this.persistLocal();
+    }
+
     return member;
   }
 
-  public getActivitiesForShop(shopId: string): ActivityLog[] {
+  // ---------- Activities, Notifications, Idempotency & WhatsApp Threads ----------
+  public async getActivitiesForShop(shopId: string): Promise<ActivityLog[]> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await this.ensureSupabaseSeeded();
+      const { data } = await sb
+        .from('activities')
+        .select('*')
+        .eq('shop_id', shopId)
+        .order('created_at', { ascending: false })
+        .limit(200);
+      return (data || []).map((r) => rowToActivity(r as Record<string, unknown>));
+    }
     return this.state.activities
       .filter((a) => a.shopId === shopId)
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }
 
-  public markNotificationsRead(shopId: string): void {
+  public async markNotificationsRead(shopId: string): Promise<void> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('staff_notifications').update({ read: true }).eq('shop_id', shopId);
+      return;
+    }
     for (const notif of this.state.notifications) {
       if (notif.shopId === shopId) notif.read = true;
     }
-    this.persist();
+    this.persistLocal();
   }
 
-  public logActivity(entry: Omit<ActivityLog, 'id' | 'createdAt'>): ActivityLog {
+  public async logActivity(entry: Omit<ActivityLog, 'id' | 'createdAt'>): Promise<ActivityLog> {
     const log: ActivityLog = {
       ...entry,
       id: `act_${crypto.randomUUID().slice(0, 8)}`,
       createdAt: new Date().toISOString(),
     };
-    this.state.activities.unshift(log);
-    if (this.state.activities.length > 500) {
-      this.state.activities = this.state.activities.slice(0, 500);
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('activities').insert(activityToRow(log));
+    } else {
+      this.state.activities.unshift(log);
+      if (this.state.activities.length > 500) {
+        this.state.activities = this.state.activities.slice(0, 500);
+      }
+      this.persistLocal();
     }
-    this.persist();
     return log;
   }
 
-  public isMessageProcessed(messageId: string): boolean {
+  public async isMessageProcessed(messageId: string): Promise<boolean> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      const { data } = await sb
+        .from('processed_messages')
+        .select('message_id')
+        .eq('message_id', messageId)
+        .maybeSingle();
+      return Boolean(data);
+    }
     return this.state.processedMessageIds.includes(messageId);
   }
 
-  public markMessageProcessed(messageId: string): void {
+  public async markMessageProcessed(messageId: string): Promise<void> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('processed_messages').upsert({
+        message_id: messageId,
+        created_at: new Date().toISOString(),
+      });
+      return;
+    }
     if (!this.state.processedMessageIds.includes(messageId)) {
       this.state.processedMessageIds.push(messageId);
       if (this.state.processedMessageIds.length > 1000) {
         this.state.processedMessageIds = this.state.processedMessageIds.slice(-1000);
       }
-      this.persist();
+      this.persistLocal();
     }
   }
 
-  public getDashboardSnapshot(shopId: string) {
-    const shop = this.getShopById(shopId);
+  public async getWhatsAppThread(shopId: string, phone: string): Promise<WhatsAppThreadState> {
+    const key = `${shopId}::${canonicalPhoneKey(phone) || normalizePhoneDisplay(phone)}`;
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      const { data } = await sb
+        .from('whatsapp_threads')
+        .select('*')
+        .eq('thread_key', key)
+        .maybeSingle();
+      if (data) {
+        return {
+          threadKey: String(data.thread_key),
+          shopId: String(data.shop_id),
+          phone: String(data.phone),
+          history: Array.isArray(data.history) ? (data.history as ChatHistoryTurn[]) : [],
+          pendingConfirmation: (data.pending_confirmation as PendingConfirmation) || null,
+          updatedAt: String(data.updated_at),
+        };
+      }
+    } else if (this.state.whatsappThreads[key]) {
+      return this.state.whatsappThreads[key];
+    }
+
+    return {
+      threadKey: key,
+      shopId,
+      phone: canonicalPhoneKey(phone) || normalizePhoneDisplay(phone),
+      history: [],
+      pendingConfirmation: null,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  public async saveWhatsAppThread(
+    shopId: string,
+    phone: string,
+    next: { history: ChatHistoryTurn[]; pendingConfirmation: PendingConfirmation | null }
+  ): Promise<void> {
+    const canonical = canonicalPhoneKey(phone) || normalizePhoneDisplay(phone);
+    const key = `${shopId}::${canonical}`;
+    const trimmedHistory = next.history.slice(-8);
+    const now = new Date().toISOString();
+
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('whatsapp_threads').upsert({
+        thread_key: key,
+        shop_id: shopId,
+        phone: canonical,
+        history: trimmedHistory,
+        pending_confirmation: next.pendingConfirmation,
+        updated_at: now,
+      });
+      return;
+    }
+
+    this.state.whatsappThreads[key] = {
+      threadKey: key,
+      shopId,
+      phone: canonical,
+      history: trimmedHistory,
+      pendingConfirmation: next.pendingConfirmation,
+      updatedAt: now,
+    };
+    this.persistLocal();
+  }
+
+  // ---------- Dashboard Snapshot ----------
+  public async getDashboardSnapshot(shopId: string, requesterUserId?: string) {
+    const shop = await this.getShopById(shopId);
     if (!shop) return undefined;
 
-    const products = this.getProductsForShop(shopId);
-    const staff = this.getStaffForShop(shopId);
-    const activities = this.getActivitiesForShop(shopId);
-    const purchases = this.state.purchases
-      .filter((p) => p.shopId === shopId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    const stockLosses = this.state.stockLosses
-      .filter((l) => l.shopId === shopId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    const notifications = this.state.notifications
-      .filter((n) => n.shopId === shopId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    const sb = getSupabaseAdmin();
+    const [allShops, products, staff, activities] = await Promise.all([
+      this.getAccessibleShops(requesterUserId),
+      this.getProductsForShop(shopId),
+      this.getStaffForShop(shopId),
+      this.getActivitiesForShop(shopId),
+    ]);
+
+    let purchases: PurchaseRecord[];
+    let stockLosses: StockLossRecord[];
+    let notifications: StaffNotification[];
+
+    if (sb) {
+      const [purRes, lossRes, notifRes] = await Promise.all([
+        sb
+          .from('purchases')
+          .select('*')
+          .eq('shop_id', shopId)
+          .order('created_at', { ascending: false }),
+        sb
+          .from('stock_losses')
+          .select('*')
+          .eq('shop_id', shopId)
+          .order('created_at', { ascending: false }),
+        sb
+          .from('staff_notifications')
+          .select('*')
+          .eq('shop_id', shopId)
+          .order('created_at', { ascending: false }),
+      ]);
+      purchases = (purRes.data || []).map((r) => rowToPurchase(r as Record<string, unknown>));
+      stockLosses = (lossRes.data || []).map((r) => rowToLoss(r as Record<string, unknown>));
+      notifications = (notifRes.data || []).map((r) =>
+        rowToNotification(r as Record<string, unknown>)
+      );
+    } else {
+      purchases = this.state.purchases
+        .filter((p) => p.shopId === shopId)
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      stockLosses = this.state.stockLosses
+        .filter((l) => l.shopId === shopId)
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      notifications = this.state.notifications
+        .filter((n) => n.shopId === shopId)
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    }
 
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
@@ -1585,7 +2473,7 @@ class SmartStoreRepository {
 
     return {
       shop,
-      allShops: this.getAllShops(),
+      allShops,
       products,
       staff,
       activities,
@@ -1607,17 +2495,29 @@ class SmartStoreRepository {
     };
   }
 
-  public getWaitlistEntries(): WaitlistEntry[] {
+  // ---------- Waitlist ----------
+  public async getWaitlistEntries(): Promise<WaitlistEntry[]> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      const { data } = await sb
+        .from('waitlist')
+        .select('*')
+        .order('created_at', { ascending: true });
+      return (data || []).map((r) => rowToWaitlist(r as Record<string, unknown>));
+    }
     return this.state.waitlist;
   }
 
-  public getWaitlistSummary(): WaitlistSummary {
-    return {
-      totalCount: this.state.waitlist.length,
-    };
+  public async getWaitlistSummary(): Promise<WaitlistSummary> {
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      const { count } = await sb.from('waitlist').select('id', { count: 'exact', head: true });
+      return { totalCount: count ?? 0 };
+    }
+    return { totalCount: this.state.waitlist.length };
   }
 
-  public joinWaitlist(input: {
+  public async joinWaitlist(input: {
     fullName: string;
     shopName: string;
     city: string;
@@ -1625,22 +2525,24 @@ class SmartStoreRepository {
     whatsappNumber: string;
     storeCategory: StoreCategoryOption;
     staffCountRange: StaffCountRange;
-  }): WaitlistJoinResponse {
+  }): Promise<WaitlistJoinResponse> {
     const normalizedEmail = input.email.trim().toLowerCase();
-    const normalizedPhone = this.normalizePhone(input.whatsappNumber);
+    const normalizedPhone = normalizePhoneDisplay(input.whatsappNumber);
+    const existingList = await this.getWaitlistEntries();
 
-    const existingIdx = this.state.waitlist.findIndex((item) => {
+    const existingIdx = existingList.findIndex((item) => {
       const emailMatch =
         Boolean(normalizedEmail) && item.email.trim().toLowerCase() === normalizedEmail;
       const phoneMatch =
-        Boolean(normalizedPhone) && this.normalizePhone(item.whatsappNumber) === normalizedPhone;
+        Boolean(normalizedPhone) &&
+        canonicalPhoneKey(item.whatsappNumber) === canonicalPhoneKey(normalizedPhone);
       return emailMatch || phoneMatch;
     });
 
     if (existingIdx !== -1) {
       return {
         position: existingIdx + 1,
-        totalCount: this.state.waitlist.length,
+        totalCount: existingList.length,
         alreadyJoined: true,
       };
     }
@@ -1657,10 +2559,26 @@ class SmartStoreRepository {
       createdAt: new Date().toISOString(),
     };
 
-    this.state.waitlist.push(entry);
-    this.persist();
-    void syncWaitlistExcelFile(this.state.waitlist);
+    const sb = getSupabaseAdmin();
+    if (sb) {
+      await sb.from('waitlist').insert({
+        id: entry.id,
+        full_name: entry.fullName,
+        shop_name: entry.shopName,
+        city: entry.city,
+        email: entry.email,
+        whatsapp_number: entry.whatsappNumber,
+        store_category: entry.storeCategory,
+        staff_count_range: entry.staffCountRange,
+        created_at: entry.createdAt,
+      });
+    } else {
+      this.state.waitlist.push(entry);
+      this.persistLocal();
+      void syncWaitlistExcelFile(this.state.waitlist);
+    }
 
+    const nextTotal = existingList.length + 1;
     return {
       entry: {
         id: entry.id,
@@ -1671,8 +2589,8 @@ class SmartStoreRepository {
         staffCountRange: entry.staffCountRange,
         createdAt: entry.createdAt,
       },
-      position: this.state.waitlist.length,
-      totalCount: this.state.waitlist.length,
+      position: nextTotal,
+      totalCount: nextTotal,
       alreadyJoined: false,
     };
   }
