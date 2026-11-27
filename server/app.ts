@@ -28,19 +28,34 @@ export function createApiApp() {
 
   // Invisible private Excel export route configured strictly via server-side env vars.
   // Never referenced in client code and returns 404 unless both secret path & key match.
-  const rawSecretRoute = process.env.WAITLIST_SECRET_ROUTE?.trim();
-  const rawAdminKey = process.env.WAITLIST_ADMIN_KEY?.trim();
+  const stripWrappingQuotes = (val?: string) =>
+    (val || '').trim().replace(/^["']|["']$/g, '').trim();
+
+  const rawSecretRoute = stripWrappingQuotes(process.env.WAITLIST_SECRET_ROUTE);
+  const rawAdminKey = stripWrappingQuotes(process.env.WAITLIST_ADMIN_KEY);
   if (
     rawSecretRoute &&
     rawAdminKey &&
     rawSecretRoute !== 'MY_WAITLIST_SECRET_ROUTE' &&
     rawAdminKey !== 'MY_WAITLIST_ADMIN_KEY'
   ) {
-    const normalizedRoute = rawSecretRoute.startsWith('/')
-      ? rawSecretRoute
-      : `/${rawSecretRoute}`;
+    let routePath = rawSecretRoute;
+    if (/^https?:\/\//i.test(routePath)) {
+      try {
+        routePath = new URL(routePath).pathname;
+      } catch {
+        // Keep raw value if URL parsing fails
+      }
+    }
+    routePath = routePath.replace(/\/+$/, '');
+    if (!routePath.startsWith('/')) {
+      routePath = `/${routePath}`;
+    }
+    if (!routePath.startsWith('/api/')) {
+      routePath = `/api${routePath}`;
+    }
 
-    app.get(normalizedRoute, async (req, res) => {
+    app.get(routePath, async (req, res) => {
       try {
         const bearerHeader = req.headers.authorization?.startsWith('Bearer ')
           ? req.headers.authorization.slice(7)
