@@ -1,8 +1,15 @@
+import crypto from 'crypto';
 import express from 'express';
 import { store } from './store.ts';
 import { processIncomingWhatsAppEvent } from './whatsappProcessor.ts';
 import { getActiveAiInfo, transcribeVoiceNote } from './ai.ts';
-import type { StaffRole, SubscriptionPlanId } from '../src/types.ts';
+import { generateWaitlistExcelBuffer } from './waitlistExcel.ts';
+import type {
+  StaffCountRange,
+  StaffRole,
+  StoreCategoryOption,
+  SubscriptionPlanId,
+} from '../src/types.ts';
 
 export function createApiApp() {
   const app = express();
@@ -12,6 +19,128 @@ export function createApiApp() {
   app.get('/api/health', async (_req, res) => {
     const ai = await getActiveAiInfo();
     res.json({ ok: true, service: 'Sabi AI', ai });
+  });
+
+  // Public waitlist summary (returns aggregate count only — zero PII or user fields)
+  app.get('/api/waitlist', (_req, res) => {
+    res.json(store.getWaitlistSummary());
+  });
+
+  // Invisible private Excel export route configured strictly via server-side env vars.
+  // Never referenced in client code and returns 404 unless both secret path & key match.
+  const rawSecretRoute = process.env.WAITLIST_SECRET_ROUTE?.trim();
+  const rawAdminKey = process.env.WAITLIST_ADMIN_KEY?.trim();
+  if (
+    rawSecretRoute &&
+    rawAdminKey &&
+    rawSecretRoute !== 'MY_WAITLIST_SECRET_ROUTE' &&
+    rawAdminKey !== 'MY_WAITLIST_ADMIN_KEY'
+  ) {
+    const normalizedRoute = rawSecretRoute.startsWith('/')
+      ? rawSecretRoute
+      : `/${rawSecretRoute}`;
+
+    app.get(normalizedRoute, async (req, res) => {
+      try {
+        const bearerHeader = req.headers.authorization?.startsWith('Bearer ')
+          ? req.headers.authorization.slice(7)
+          : '';
+        const providedKey = String(
+          req.headers['x-admin-key'] || bearerHeader || req.query.key || ''
+        ).trim();
+
+        const expectedDigest = crypto.createHash('sha256').update(rawAdminKey).digest();
+        const providedDigest = crypto.createHash('sha256').update(providedKey).digest();
+        if (!providedKey || !crypto.timingSafeEqual(expectedDigest, providedDigest)) {
+          res.status(404).send('Not found');
+          return;
+        }
+
+        const entries = store.getWaitlistEntries();
+        const buffer = await generateWaitlistExcelBuffer(entries);
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        res.setHeader('Content-Disposition', 'attachment; filename="sabi-ai-waitlist.xlsx"');
+        res.setHeader('Cache-Control', 'no-store');
+        res.send(buffer);
+      } catch (err) {
+        console.error('Private waitlist export error:', err);
+        res.status(500).json({ error: 'Could not generate waitlist Excel file.' });
+      }
+    });
+  }
+
+  // Join the Sabi AI waitlist
+  app.post('/api/waitlist', (req, res) => {
+    const {
+      fullName,
+      shopName,
+      city,
+      email,
+      whatsappNumber,
+      storeCategory,
+      staffCountRange,
+    } = req.body || {};
+
+    const cleanName = String(fullName || '').trim();
+    const cleanShop = String(shopName || '').trim();
+    const cleanCity = String(city || '').trim();
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanPhone = String(whatsappNumber || '').trim();
+
+    if (!cleanName || !cleanShop) {
+      res.status(400).json({ error: 'Please enter your full name and shop name.' });
+      return;
+    }
+
+    if (!cleanEmail && !cleanPhone) {
+      res.status(400).json({ error: 'Please provide an email address or WhatsApp number.' });
+      return;
+    }
+
+    if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      res.status(400).json({ error: 'Please enter a valid email address.' });
+      return;
+    }
+
+    const phoneDigits = cleanPhone.replace(/\D/g, '');
+    if (cleanPhone && phoneDigits.length < 8) {
+      res.status(400).json({ error: 'Please enter a valid WhatsApp phone number.' });
+      return;
+    }
+
+    const allowedCategories: StoreCategoryOption[] = [
+      'Supermarket',
+      'Provision store',
+      'Mini-mart',
+      'Wholesale',
+      'Pharmacy',
+      'Other retail',
+    ];
+    const safeCategory: StoreCategoryOption = allowedCategories.includes(
+      storeCategory as StoreCategoryOption
+    )
+      ? (storeCategory as StoreCategoryOption)
+      : 'Supermarket';
+
+    const allowedRanges: StaffCountRange[] = ['1-3', '4-10', '11+'];
+    const safeRange: StaffCountRange = allowedRanges.includes(staffCountRange as StaffCountRange)
+      ? (staffCountRange as StaffCountRange)
+      : '1-3';
+
+    const result = store.joinWaitlist({
+      fullName: cleanName,
+      shopName: cleanShop,
+      city: cleanCity || 'Lagos, Nigeria',
+      email: cleanEmail,
+      whatsappNumber: cleanPhone,
+      storeCategory: safeCategory,
+      staffCountRange: safeRange,
+    });
+
+    res.status(result.alreadyJoined ? 200 : 201).json(result);
   });
 
   // List all shops (for tenant switcher)
@@ -372,6 +501,11 @@ export function createApiApp() {
       console.error('Voice note error:', err);
       res.status(500).json({ status: 'error', error: message });
     }
+  });
+
+  // Never fall through unmatched /api/* routes to SPA HTML
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'Not found' });
   });
 
   return app;

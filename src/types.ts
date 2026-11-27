@@ -178,3 +178,45 @@ export interface DashboardSnapshot {
     avgGrossMarginPct: number;
   };
 }
+
+export type StoreCategoryOption =
+  | 'Supermarket'
+  | 'Provision store'
+  | 'Mini-mart'
+  | 'Wholesale'
+  | 'Pharmacy'
+  | 'Other retail';
+
+export type StaffCountRange = '1-3' | '4-10' | '11+';
+
+export interface WaitlistEntry {
+  id: string;
+  fullName: string;
+  shopName: string;
+  city: string;
+  email: string;
+  whatsappNumber: string;
+  storeCategory: StoreCategoryOption;
+  staffCountRange: StaffCountRange;
+  createdAt: string;
+}
+
+export interface WaitlistSummary {
+  totalCount: number;
+}
+
+export interface WaitlistJoinResponse {
+  entry?: {
+    id: string;
+    fullName: string;
+    shopName: string;
+    city: string;
+    storeCategory: StoreCategoryOption;
+    staffCountRange: StaffCountRange;
+    createdAt: string;
+  };
+  position: number;
+  totalCount: number;
+  alreadyJoined: boolean;
+}
+

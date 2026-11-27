@@ -6,9 +6,13 @@ import type {
   Shop,
   StaffMember,
   StaffRole,
+  StaffCountRange,
   StockAdjustmentReason,
   StockLossRecord,
+  StoreCategoryOption,
   SubscriptionPlanId,
+  WaitlistJoinResponse,
+  WaitlistSummary,
 } from '../types';
 
 async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
@@ -30,6 +34,25 @@ export const api = {
     ai: { provider: 'groq' | 'gemini'; textModel: string; audioModel: string };
   }> {
     return requestJson('/api/health');
+  },
+
+  getWaitlistSummary(): Promise<WaitlistSummary> {
+    return requestJson('/api/waitlist');
+  },
+
+  joinWaitlist(payload: {
+    fullName: string;
+    shopName: string;
+    city: string;
+    email: string;
+    whatsappNumber: string;
+    storeCategory: StoreCategoryOption;
+    staffCountRange: StaffCountRange;
+  }): Promise<WaitlistJoinResponse> {
+    return requestJson('/api/waitlist', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
   },
 
   getDashboard(shopId: string): Promise<DashboardSnapshot> {

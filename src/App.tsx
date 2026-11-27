@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   Activity,
+  ArrowLeft,
   Boxes,
   Building2,
   LayoutDashboard,
@@ -24,6 +25,7 @@ import { ActivityView } from './components/ActivityView';
 import { WhatsAppSettingsView } from './components/WhatsAppSettingsView';
 import { WhatsAppSimulator } from './components/WhatsAppSimulator';
 import { NewShopModal } from './components/NewShopModal';
+import { LandingPage } from './components/LandingPage';
 
 type NavTab =
   | 'dashboard'
@@ -45,6 +47,14 @@ const NAV_ITEMS: Array<{ id: NavTab; label: string; icon: typeof LayoutDashboard
 ];
 
 export default function App() {
+  const [viewMode, setViewMode] = useState<'landing' | 'demo'>(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('view') === 'demo') return 'demo';
+    }
+    return 'landing';
+  });
+
   const [shops, setShops] = useState<Shop[]>([]);
   const [activeShopId, setActiveShopId] = useState<string>('shop_adebayo_lagos');
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
@@ -97,6 +107,24 @@ export default function App() {
 
   const currentNavLabel =
     NAV_ITEMS.find((n) => n.id === activeTab)?.label || 'Dashboard';
+
+  function switchViewMode(next: 'landing' | 'demo') {
+    setViewMode(next);
+    if (typeof window !== 'undefined') {
+      const url = new URL(window.location.href);
+      if (next === 'demo') {
+        url.searchParams.set('view', 'demo');
+      } else {
+        url.searchParams.delete('view');
+      }
+      window.history.replaceState({}, '', url.toString());
+      window.scrollTo({ top: 0 });
+    }
+  }
+
+  if (viewMode === 'landing') {
+    return <LandingPage onOpenDemo={() => switchViewMode('demo')} />;
+  }
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col lg:flex-row">
@@ -168,14 +196,24 @@ export default function App() {
         </nav>
 
         {/* Plan Summary Footer */}
-        {snapshot && (
-          <div className="px-4 py-3.5 border-t border-slate-200 text-xs text-slate-500">
-            <p className="font-medium text-slate-700 truncate">{actorName}</p>
-            <p className="capitalize">
-              {snapshot.shop.planId.replace('_', '-')} plan · Isolated DB
-            </p>
-          </div>
-        )}
+        <div className="px-4 py-3.5 border-t border-slate-200 text-xs text-slate-500 space-y-2.5">
+          {snapshot && (
+            <div>
+              <p className="font-medium text-slate-700 truncate">{actorName}</p>
+              <p className="capitalize">
+                {snapshot.shop.planId.replace('_', '-')} plan · Isolated DB
+              </p>
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() => switchViewMode('landing')}
+            className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 hover:text-emerald-800 cursor-pointer whitespace-nowrap"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            Back to waitlist page
+          </button>
+        </div>
       </aside>
 
       {/* Mobile Top Header */}
@@ -283,6 +321,19 @@ export default function App() {
                 );
               })}
             </nav>
+            <div className="mt-auto p-4 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  switchViewMode('landing');
+                }}
+                className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 hover:text-emerald-800 cursor-pointer"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                Back to waitlist page
+              </button>
+            </div>
           </div>
         </div>
       )}

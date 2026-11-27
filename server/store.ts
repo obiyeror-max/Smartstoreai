@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { syncWaitlistExcelFile } from './waitlistExcel.ts';
 import type {
   ActivityLog,
   Product,
@@ -9,9 +10,14 @@ import type {
   StaffMember,
   StaffNotification,
   StaffRole,
+  StaffCountRange,
   StockAdjustmentReason,
   StockLossRecord,
+  StoreCategoryOption,
   SubscriptionPlanId,
+  WaitlistEntry,
+  WaitlistJoinResponse,
+  WaitlistSummary,
 } from '../src/types.ts';
 
 interface DatabaseState {
@@ -23,6 +29,7 @@ interface DatabaseState {
   stockLosses: StockLossRecord[];
   notifications: StaffNotification[];
   processedMessageIds: string[];
+  waitlist: WaitlistEntry[];
 }
 
 const DATA_DIR =
@@ -660,6 +667,7 @@ function createSeedState(): DatabaseState {
     stockLosses,
     notifications,
     processedMessageIds: [],
+    waitlist: [],
   };
 }
 
@@ -692,6 +700,7 @@ class SmartStoreRepository {
 
   constructor() {
     this.state = this.load();
+    void syncWaitlistExcelFile(this.state.waitlist);
   }
 
   private load(): DatabaseState {
@@ -710,6 +719,7 @@ class SmartStoreRepository {
             stockLosses: parsed.stockLosses || seed.stockLosses,
             notifications: parsed.notifications || seed.notifications,
             processedMessageIds: parsed.processedMessageIds || [],
+            waitlist: Array.isArray(parsed.waitlist) ? parsed.waitlist : seed.waitlist,
           };
           return migrated;
         }
@@ -1594,6 +1604,76 @@ class SmartStoreRepository {
         totalLossValue,
         avgGrossMarginPct,
       },
+    };
+  }
+
+  public getWaitlistEntries(): WaitlistEntry[] {
+    return this.state.waitlist;
+  }
+
+  public getWaitlistSummary(): WaitlistSummary {
+    return {
+      totalCount: this.state.waitlist.length,
+    };
+  }
+
+  public joinWaitlist(input: {
+    fullName: string;
+    shopName: string;
+    city: string;
+    email: string;
+    whatsappNumber: string;
+    storeCategory: StoreCategoryOption;
+    staffCountRange: StaffCountRange;
+  }): WaitlistJoinResponse {
+    const normalizedEmail = input.email.trim().toLowerCase();
+    const normalizedPhone = this.normalizePhone(input.whatsappNumber);
+
+    const existingIdx = this.state.waitlist.findIndex((item) => {
+      const emailMatch =
+        Boolean(normalizedEmail) && item.email.trim().toLowerCase() === normalizedEmail;
+      const phoneMatch =
+        Boolean(normalizedPhone) && this.normalizePhone(item.whatsappNumber) === normalizedPhone;
+      return emailMatch || phoneMatch;
+    });
+
+    if (existingIdx !== -1) {
+      return {
+        position: existingIdx + 1,
+        totalCount: this.state.waitlist.length,
+        alreadyJoined: true,
+      };
+    }
+
+    const entry: WaitlistEntry = {
+      id: `wl_${crypto.randomUUID().slice(0, 8)}`,
+      fullName: input.fullName.trim(),
+      shopName: input.shopName.trim(),
+      city: input.city.trim(),
+      email: normalizedEmail,
+      whatsappNumber: normalizedPhone,
+      storeCategory: input.storeCategory,
+      staffCountRange: input.staffCountRange,
+      createdAt: new Date().toISOString(),
+    };
+
+    this.state.waitlist.push(entry);
+    this.persist();
+    void syncWaitlistExcelFile(this.state.waitlist);
+
+    return {
+      entry: {
+        id: entry.id,
+        fullName: entry.fullName,
+        shopName: entry.shopName,
+        city: entry.city,
+        storeCategory: entry.storeCategory,
+        staffCountRange: entry.staffCountRange,
+        createdAt: entry.createdAt,
+      },
+      position: this.state.waitlist.length,
+      totalCount: this.state.waitlist.length,
+      alreadyJoined: false,
     };
   }
 }
